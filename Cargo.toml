@@ -1,0 +1,26 @@
+[package]
+name = "lastwave-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight terminal port of LastWave: YouTube Music + local hi-res playback through mpv"
+
+[dependencies]
+ratatui = "0.29"
+ureq = { version = "2.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+dirs = "5"
+walkdir = "2"
+lofty = "0.22"
+ratatui-image = { version = "8.0.1", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+sha1 = "0.10"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
