@@ -13,7 +13,8 @@ It uses the same audio engine (mpv) and no webview.
 
 ### 1. Install the Rust toolchain
 
-Install Rust (stable, 1.80 or newer) from <https://rustup.rs>:
+Install Rust (stable, 1.89 or newer — required by the locked dependencies) from <https://rustup.rs>
+(already installed? `rustup update stable`):
 
 - **Windows**: download and run `rustup-init.exe`. The MSVC toolchain also needs the
   "Desktop development with C++" workload from the Visual Studio Build Tools.

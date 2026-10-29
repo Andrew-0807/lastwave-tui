@@ -131,6 +131,8 @@ impl Mpv {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = cmd.spawn().map_err(|e| format!("could not start mpv ({}): {e}", cfg.mpv_path))?;
+        #[cfg(windows)]
+        kill_with_parent(&child);
 
         let (ev_r, mut ev_w) = match connect_retry(&ipc) {
             Ok(c) => c,
@@ -141,7 +143,10 @@ impl Mpv {
         };
         for (i, p) in OBSERVED.iter().enumerate() {
             let line = json!({"command": ["observe_property", i + 1, p]}).to_string() + "\n";
-            ev_w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+            if let Err(e) = ev_w.write_all(line.as_bytes()) {
+                let _ = child.kill();
+                return Err(e.to_string());
+            }
         }
         thread::spawn(move || {
             let _keep = ev_w;
@@ -162,7 +167,13 @@ impl Mpv {
             let _ = events.send(Msg::Mpv(MpvEvent::Exited));
         });
 
-        let (cmd_r, mut cmd_w) = connect_retry(&ipc)?;
+        let (cmd_r, mut cmd_w) = match connect_retry(&ipc) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e);
+            }
+        };
         let (tx, rx) = mpsc::channel::<Cmd>();
         thread::spawn(move || {
             let mut reader = BufReader::new(cmd_r);
@@ -219,5 +230,56 @@ impl Mpv {
             thread::sleep(Duration::from_millis(20));
         }
         let _ = self.child.kill();
+    }
+}
+
+/// Never leave mpv playing on its own: covers early returns, panics that
+/// unwind through the owner and a forgotten `quit()`.
+impl Drop for Mpv {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Put mpv (and the yt-dlp it starts) in a job object that is killed when
+/// its last handle closes, i.e. when this process ends for any reason
+/// (console closed, killed from Task Manager). One job for the whole run;
+/// its handle is deliberately never closed.
+#[cfg(windows)]
+fn kill_with_parent(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    static JOB: OnceLock<usize> = OnceLock::new();
+    // SAFETY: plain Win32 calls on our own job handle and the live child's
+    // process handle; the info struct is zero-initialised POD.
+    unsafe {
+        let job = *JOB.get_or_init(|| {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return 0;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                return 0;
+            }
+            job as usize
+        });
+        if job != 0 {
+            AssignProcessToJobObject(job as _, child.as_raw_handle() as _);
+        }
     }
 }

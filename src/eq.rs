@@ -77,17 +77,22 @@ impl EqState {
         if !self.active() {
             return String::new();
         }
-        let bands: Vec<String> = self
-            .combined()
+        let gains = self.combined();
+        let mut stages: Vec<String> = gains
             .iter()
             .zip(BANDS)
             .filter(|(g, _)| g.abs() >= 0.05)
             .map(|(g, f)| format!("equalizer=f={f}:t=o:w=1:g={g:.1}"))
             .collect();
-        if bands.is_empty() {
+        if stages.is_empty() {
             return String::new();
         }
-        format!("format=floatp,lavfi=[{}]", bands.join(","))
+        // Headroom: cut by the largest boost first so stacked boosts can't clip.
+        let boost = gains.iter().copied().fold(0.0, f64::max);
+        if boost >= 0.05 {
+            stages.insert(0, format!("volume=volume=-{boost:.1}dB"));
+        }
+        format!("format=floatp,lavfi=[{}]", stages.join(","))
     }
 
     pub fn apply_preset(&mut self, idx: usize) {
@@ -104,4 +109,30 @@ impl EqState {
 
 pub fn band_label(hz: u32) -> String {
     if hz >= 1000 { format!("{}k", hz / 1000) } else { hz.to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_has_headroom_for_largest_boost() {
+        let mut eq = EqState { enabled: true, ..Default::default() };
+        eq.gains[0] = 3.0;
+        eq.gains[5] = 6.0;
+        eq.gains[9] = -2.0;
+        assert_eq!(
+            eq.filter(),
+            "format=floatp,lavfi=[volume=volume=-6.0dB,equalizer=f=31:t=o:w=1:g=3.0,\
+             equalizer=f=1000:t=o:w=1:g=6.0,equalizer=f=16000:t=o:w=1:g=-2.0]"
+        );
+    }
+
+    #[test]
+    fn cuts_only_need_no_preamp() {
+        let mut eq = EqState { enabled: true, ..Default::default() };
+        eq.gains[2] = -4.0;
+        assert_eq!(eq.filter(), "format=floatp,lavfi=[equalizer=f=125:t=o:w=1:g=-4.0]");
+        assert_eq!(EqState::default().filter(), "");
+    }
 }

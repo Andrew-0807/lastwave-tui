@@ -9,7 +9,28 @@ const EXTS: &[&str] = &[
     "flac", "alac", "m4a", "mp3", "aac", "ogg", "opus", "wav", "aif", "aiff", "ape", "wv", "dsf", "dff", "mka", "wma",
 ];
 
-pub fn scan(dir: &Path) -> Vec<Track> {
+/// Why a library folder can't be scanned, in words the status line can show.
+pub fn check_dir(dir: &Path) -> Result<(), String> {
+    if dir.as_os_str().is_empty() {
+        return Err("Library folder is not set (Settings → Library folder)".into());
+    }
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(dir)
+            .map(|_| ())
+            .map_err(|e| format!("Library folder {} can't be read: {e}", dir.display())),
+        Ok(_) => Err(format!("Library path {} is a file, not a folder", dir.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("Library folder {} does not exist", dir.display()))
+        }
+        Err(e) => Err(format!("Library folder {}: {e}", dir.display())),
+    }
+}
+
+/// Every audio file under `dir`, sorted by artist / album / disc / track;
+/// an unusable folder is an error the status line can show. A file whose tags make the reader fail (or panic) is still listed, with
+/// its file name as title, so one damaged file can't break the scan.
+pub fn try_scan(dir: &Path) -> Result<Vec<Track>, String> {
+    check_dir(dir)?;
     let mut items: Vec<((String, String, u32, u32), Track)> = WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
@@ -24,7 +45,7 @@ pub fn scan(dir: &Path) -> Vec<Track> {
         .map(|e| read(e.path()))
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
-    items.into_iter().map(|(_, t)| t).collect()
+    Ok(items.into_iter().map(|(_, t)| t).collect())
 }
 
 fn read(path: &Path) -> ((String, String, u32, u32), Track) {
@@ -40,7 +61,9 @@ fn read(path: &Path) -> ((String, String, u32, u32), Track) {
         art: String::new(),
     };
     let (mut disc, mut no) = (0, 0);
-    if let Ok(f) = lofty::read_from_path(path) {
+    // lofty can panic on malformed files; treat that like a read error.
+    let tagged = std::panic::catch_unwind(|| lofty::read_from_path(path)).ok().and_then(Result::ok);
+    if let Some(f) = tagged {
         let p = f.properties();
         t.duration = p.duration().as_secs() as u32;
         let rate = p.sample_rate().map(|r| format!("{:.1}", r as f64 / 1000.0).trim_end_matches(".0").to_string());

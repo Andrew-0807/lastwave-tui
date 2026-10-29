@@ -6,11 +6,11 @@
 //! or cookies.txt), sent with the SAPISIDHASH Authorization header exactly
 //! like LastWave's cookie login.
 
-use crate::model::{parse_duration, Source, Track};
+use crate::model::{clean_title, parse_duration, primary_artist, Source, Track};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +20,8 @@ const ORIGIN: &str = "https://music.youtube.com";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0";
 const CLIENT_VERSION: &str = "1.20260707.12.00";
 const MAX_PAGES: usize = 20;
+/// Upper bound on tracks loaded from one album/playlist page (see `browse`).
+const MAX_TRACKS: usize = 10_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -114,6 +116,10 @@ fn post(endpoint: &str, mut body: Value) -> Result<Value, String> {
         .set("X-YouTube-Client-Name", "67")
         .set("X-YouTube-Client-Version", CLIENT_VERSION);
     if let Some(c) = AUTH.read().ok().and_then(|a| a.clone()) {
+        // Cookies saved by an older build may hold bytes a header can't carry.
+        if !c.split("; ").all(valid_cookie) {
+            return Err("The saved YouTube cookies are malformed — paste them again in Settings".into());
+        }
         if let Some(h) = sapisid_hash(&c) {
             req = req.set("Authorization", &h);
         }
@@ -134,10 +140,43 @@ pub fn search(query: &str, kind: Kind) -> Result<Results, String> {
         return r;
     }
     let root = post("search", json!({"query": q, "params": kind.filter()}))?;
-    Ok(match kind {
-        Kind::Songs => Results::Tracks(parse_tracks(&root)),
-        _ => Results::Collections(parse_collections(&root)),
-    })
+    parse_search(&root, kind)
+}
+
+fn parse_search(root: &Value, kind: Kind) -> Result<Results, String> {
+    let (results, n) = match kind {
+        Kind::Songs => {
+            let t = parse_tracks(root);
+            let n = t.len();
+            (Results::Tracks(t), n)
+        }
+        _ => {
+            let c = parse_collections(root);
+            let n = c.len();
+            (Results::Collections(c), n)
+        }
+    };
+    if n == 0 && !recognised_empty(root) {
+        return Err("YouTube response format not recognised — the app may need an update".into());
+    }
+    Ok(results)
+}
+
+/// Whether a response that parsed to nothing is a genuine "no results" page
+/// rather than a layout we no longer understand: it must have the usual
+/// section list, and none of its shelves may hold items we failed to read.
+fn recognised_empty(root: &Value) -> bool {
+    let mut lists = Vec::new();
+    collect(root, "sectionListRenderer", &mut lists);
+    if lists.is_empty() {
+        return false;
+    }
+    let mut shelves = Vec::new();
+    for key in ["musicShelfRenderer", "musicCarouselShelfRenderer", "gridRenderer", "musicCardShelfRenderer"] {
+        collect(root, key, &mut shelves);
+    }
+    let filled = |s: &&Value| ["contents", "items"].iter().any(|k| s[*k].as_array().is_some_and(|a| !a.is_empty()));
+    !shelves.iter().any(filled)
 }
 
 /// Pasted YouTube / YouTube Music links: playlists browse, videos start a radio.
@@ -169,34 +208,117 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 pub fn browse(browse_id: &str) -> Result<Vec<Track>, String> {
     let mut root = post("browse", json!({"browseId": browse_id}))?;
     let mut tracks = parse_tracks(&root);
-    for _ in 0..MAX_PAGES {
-        root = match next_page(&root) {
-            Some(Ok(v)) => v,
-            _ => break,
-        };
-        let more = parse_tracks(&root);
-        if more.is_empty() {
+    // Follow continuations until they run out. YouTube pages ~100 tracks, so
+    // the page cap only matters as a guard against a token loop; past
+    // MAX_TRACKS (YouTube's own playlist limit is 5,000, Liked Music can go
+    // beyond) the rest of the list is deliberately not loaded.
+    dedupe(&mut tracks);
+    let mut seen: HashSet<String> = tracks.iter().map(Track::url).collect();
+    for _ in 0..MAX_TRACKS / 50 {
+        if tracks.len() >= MAX_TRACKS {
+            tracks.truncate(MAX_TRACKS);
             break;
         }
-        tracks.extend(more);
+        root = match next_page(&root) {
+            None => break,
+            Some(Ok(v)) => v,
+            // Retry once; a half-loaded list must not pass for the whole one.
+            Some(Err(_)) => match next_page(&root) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return Err(format!("stopped after {} tracks: {e}", tracks.len())),
+                None => break,
+            },
+        };
+        let before = tracks.len();
+        tracks.extend(parse_tracks(&root).into_iter().filter(|t| seen.insert(t.url())));
+        // Nothing new: the list ended, or YouTube is resending a page.
+        if tracks.len() == before {
+            break;
+        }
     }
-    dedupe(&mut tracks);
     Ok(tracks)
 }
 
 /// The watch queue YouTube Music builds for a video: the seed first, then radio.
 pub fn watch_queue(video_id: &str) -> Result<Vec<Track>, String> {
-    let root = post(
+    Ok(radio_tracks(&next(video_id)?))
+}
+
+fn next(video_id: &str) -> Result<Value, String> {
+    post(
         "next",
         json!({"videoId": video_id, "playlistId": format!("RDAMVM{video_id}"), "params": "wAEB", "isAudioOnly": true}),
-    )?;
-    let mut tracks = parse_tracks(&root);
-    dedupe(&mut tracks);
-    Ok(tracks)
+    )
+}
+
+/// Queue entries of a `next` response. YouTube lists a song together with
+/// its music-video counterpart (and sometimes the same id twice): keep one
+/// per videoId, and for an audio track (ATV) / video (OMV, UGC) pair with the
+/// same title and artist keep the audio track in the earlier slot.
+fn radio_tracks(root: &Value) -> Vec<Track> {
+    let mut rows = Vec::new();
+    collect(root, "musicResponsiveListItemRenderer", &mut rows);
+    let mut panel = Vec::new();
+    collect(root, "playlistPanelVideoRenderer", &mut panel);
+    let typed = rows
+        .into_iter()
+        .filter_map(|r| parse_row(r).map(|t| (t, video_type(r))))
+        .chain(panel.into_iter().filter_map(|r| parse_panel(r).map(|t| (t, video_type(r)))));
+
+    const ATV: &str = "MUSIC_VIDEO_TYPE_ATV";
+    let mut ids = HashSet::new();
+    let mut out: Vec<(Track, Option<&str>)> = Vec::new();
+    let mut by_song: HashMap<String, usize> = HashMap::new();
+    for (t, ty) in typed {
+        if !ids.insert(t.url()) {
+            continue;
+        }
+        let key = song_key(&t);
+        let is_video = |ty: Option<&str>| ty.is_some_and(|ty| ty != ATV);
+        match by_song.get(&key).copied() {
+            // A counterpart pair: at least one side is known to be a video.
+            Some(i) if is_video(ty) || is_video(out[i].1) => {
+                if ty == Some(ATV) {
+                    out[i] = (t, ty);
+                }
+            }
+            _ => {
+                by_song.entry(key).or_insert(out.len());
+                out.push((t, ty));
+            }
+        }
+    }
+    out.into_iter().map(|(t, _)| t).collect()
+}
+
+fn video_type(r: &Value) -> Option<&str> {
+    fn ep(root: &Value) -> Option<&str> {
+        root["watchEndpoint"]["watchEndpointMusicSupportedConfigs"]["watchEndpointMusicConfig"]["musicVideoType"]
+            .as_str()
+    }
+    ep(&r["navigationEndpoint"]).or_else(|| {
+        ep(&r["overlay"]["musicItemThumbnailOverlayRenderer"]["content"]["musicPlayButtonRenderer"]
+            ["playNavigationEndpoint"])
+    })
+}
+
+/// Title + primary artist, lower-cased, minus "(Official Video)"-style noise
+/// and the "- Topic"/"VEVO" channel suffixes videos carry.
+fn song_key(t: &Track) -> String {
+    let artist = primary_artist(&t.artist).to_lowercase();
+    let artist = artist.strip_suffix("vevo").unwrap_or(&artist).trim();
+    let norm = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    format!("{}\u{0}{}", norm(&clean_title(&t.title).to_lowercase()), norm(artist))
 }
 
 pub fn radio(video_id: &str) -> Result<Vec<Track>, String> {
-    Ok(watch_queue(video_id)?.into_iter().filter(|t| t.video_id() != Some(video_id)).collect())
+    let root = next(video_id)?;
+    // The seed may come back as its audio/video counterpart under another id.
+    let seed = parse_tracks(&root).iter().find(|t| t.video_id() == Some(video_id)).map(song_key);
+    Ok(radio_tracks(&root)
+        .into_iter()
+        .filter(|t| t.video_id() != Some(video_id) && seed.as_ref() != Some(&song_key(t)))
+        .collect())
 }
 
 /// Next page of a browse response. `continuationCommand` tokens go in the
@@ -450,7 +572,8 @@ pub fn normalize_cookies(raw: &str) -> Result<String, String> {
     if input.starts_with('[') || input.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<Value>(&input) {
             let list = v.as_array().or_else(|| v["cookies"].as_array()).cloned().unwrap_or_default();
-            for c in &list {
+            // Browser exports carry every site's cookies; keep only Google's.
+            for c in list.iter().filter(|c| c["domain"].as_str().is_none_or(google_domain)) {
                 add(&mut pairs, c["name"].as_str().unwrap_or_default(), c["value"].as_str().unwrap_or_default());
             }
             if list.is_empty() {
@@ -468,12 +591,15 @@ pub fn normalize_cookies(raw: &str) -> Result<String, String> {
             } else if line.starts_with('#') {
                 continue;
             }
-            if line.len() >= 7 && line[..7].eq_ignore_ascii_case("cookie:") {
+            // `get` rather than `[..7]`: a non-ASCII paste must not split a char.
+            if line.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("cookie:")) {
                 line = line[7..].trim();
             }
             let cols: Vec<&str> = line.split('\t').collect();
             if cols.len() >= 7 {
-                add(&mut pairs, cols[5], cols[6]);
+                if google_domain(cols[0]) {
+                    add(&mut pairs, cols[5], cols[6]);
+                }
                 continue;
             }
             for part in line.split(';') {
@@ -489,7 +615,25 @@ pub fn normalize_cookies(raw: &str) -> Result<String, String> {
     if !["__Secure-3PAPISID", "SAPISID", "APISID"].iter().any(|k| pairs.contains_key(*k)) {
         return Err("Missing SAPISID — copy the cookies from music.youtube.com while signed in".into());
     }
+    if let Some(name) = pairs.iter().find(|(k, v)| !valid_cookie(k) || !valid_cookie(v)).map(|(k, _)| k) {
+        let name: String = name.chars().take(40).collect();
+        return Err(format!("Cookie \"{name}\" has characters a Cookie header can't carry (non-ASCII?) — copy the cookies again"));
+    }
     Ok(pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "))
+}
+
+/// Cookie domain (`.youtube.com`, `accounts.google.com`, …) YouTube sign-in needs.
+fn google_domain(domain: &str) -> bool {
+    let d = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+    ["youtube.com", "google.com", "googleapis.com"]
+        .iter()
+        .any(|s| d == *s || d.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
+}
+
+/// Printable ASCII minus the header separators; anything else makes the
+/// Cookie header invalid (and ureq's error would echo the whole header).
+fn valid_cookie(s: &str) -> bool {
+    s.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';' && b != b',')
 }
 
 /// Cookie header -> Netscape cookies.txt (for yt-dlp's --cookies).
@@ -714,5 +858,100 @@ mod tests {
         let c = normalize_cookies(r#"[{"name":"SAPISID","value":"q"},{"name":"SID","value":"\"a\""}]"#).unwrap();
         assert_eq!(c, "SAPISID=q; SID=a");
         assert!(normalize_cookies("SID=abc; HSID=def").unwrap_err().contains("SAPISID"));
+    }
+
+    #[test]
+    fn non_ascii_cookie_is_an_error_not_a_panic() {
+        assert!(normalize_cookies("Cöokie: SAPISID=q").is_err());
+        // Byte 7 falls inside a char: used to panic on `line[..7]`.
+        assert!(normalize_cookies("ab\u{e9}\u{e9}\u{e9}=1").is_err());
+        let e = normalize_cookies("SAPISID=q; NAME=caf\u{e9}").unwrap_err();
+        assert!(e.contains("NAME"), "{e}");
+    }
+
+    #[test]
+    fn imports_only_google_cookies() {
+        let txt = ".youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tq\n\
+                   accounts.google.com\tTRUE\t/\tTRUE\t0\tLSID\tl\n\
+                   .bank.example\tTRUE\t/\tTRUE\t0\tSESSION\tsecret\n\
+                   .notyoutube.com\tTRUE\t/\tTRUE\t0\tEVIL\te\n";
+        assert_eq!(normalize_cookies(txt).unwrap(), "LSID=l; SAPISID=q");
+        let js = r#"[{"domain":".youtube.com","name":"SAPISID","value":"q"},{"domain":"github.com","name":"gh","value":"x"},
+                     {"domain":"www.googleapis.com","name":"G","value":"g"}]"#;
+        assert_eq!(normalize_cookies(js).unwrap(), "G=g; SAPISID=q");
+    }
+
+    fn panel(id: &str, title: &str, artist: &str, ty: &str) -> Value {
+        json!({"playlistPanelVideoRenderer": {
+            "videoId": id,
+            "title": {"runs": [{"text": title}]},
+            "longBylineText": {"runs": [{"text": artist}, {"text": " • "}, {"text": "3:00"}]},
+            "navigationEndpoint": {"watchEndpoint": {"videoId": id, "watchEndpointMusicSupportedConfigs":
+                {"watchEndpointMusicConfig": {"musicVideoType": ty}}}}
+        }})
+    }
+
+    #[test]
+    fn radio_dedupes_video_counterparts() {
+        const ATV: &str = "MUSIC_VIDEO_TYPE_ATV";
+        const OMV: &str = "MUSIC_VIDEO_TYPE_OMV";
+        let root = json!({"contents": [
+            // Video listed first, its audio counterpart nested after it.
+            {"playlistPanelVideoWrapperRenderer": {
+                "primaryRenderer": panel("vid1", "Song A (Official Video)", "Artist", OMV),
+                "counterpart": [{"counterpartRenderer": panel("aud1", "Song A", "Artist", ATV)}]
+            }},
+            panel("aud2", "Song B", "Other", ATV),
+            panel("vid2", "Song B", "OtherVEVO", "MUSIC_VIDEO_TYPE_UGC"),
+            panel("aud2", "Song B", "Other", ATV),
+            // Two genuine audio versions with the same name stay.
+            panel("aud3", "Intro", "Band", ATV),
+            panel("aud4", "Intro", "Band", ATV),
+        ]});
+        let ids: Vec<String> = radio_tracks(&root).iter().map(|t| t.video_id().unwrap().to_string()).collect();
+        assert_eq!(ids, ["aud1", "aud2", "aud3", "aud4"]);
+    }
+
+    fn song_row(id: &str, title: &str) -> Value {
+        json!({"musicResponsiveListItemRenderer": {
+            "playlistItemData": {"videoId": id},
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                    {"text": "Artist", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCx"}}},
+                    {"text": " • "}, {"text": "3:45"}]}}}
+            ]
+        }})
+    }
+
+    fn search_page(shelf_contents: Value) -> Value {
+        json!({"contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content":
+            {"sectionListRenderer": {"contents": [{"musicShelfRenderer": {"contents": shelf_contents}}]}}}}]}}})
+    }
+
+    #[test]
+    fn search_parses_valid_response() {
+        let root = search_page(json!([song_row("abc", "Hello"), song_row("def", "World")]));
+        let Ok(Results::Tracks(t)) = parse_search(&root, Kind::Songs) else { panic!("expected tracks") };
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].title.as_str(), t[0].artist.as_str(), t[0].duration), ("Hello", "Artist", 225));
+    }
+
+    #[test]
+    fn search_genuinely_empty_is_ok() {
+        let root = json!({"contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content":
+            {"sectionListRenderer": {"contents": [{"itemSectionRenderer": {"contents": [
+                {"messageRenderer": {"text": {"runs": [{"text": "No results found"}]}}}]}}]}}}}]}}});
+        assert!(matches!(parse_search(&root, Kind::Songs), Ok(Results::Tracks(t)) if t.is_empty()));
+    }
+
+    #[test]
+    fn search_unrecognised_format_is_err() {
+        // Shelf has items, but in a renderer we don't know.
+        let root = search_page(json!([{"musicFancyNewItemRenderer": {"videoId": "abc"}}]));
+        assert!(parse_search(&root, Kind::Songs).err().unwrap_or_default().contains("not recognised"));
+        assert!(parse_search(&root, Kind::Albums).is_err());
+        // No section list at all.
+        assert!(parse_search(&json!({"frameworkUpdates": {}}), Kind::Songs).is_err());
     }
 }

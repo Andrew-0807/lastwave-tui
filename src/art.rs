@@ -1,8 +1,10 @@
 //! Cover art: fetched/decoded off the UI thread, downscaled, kept in a small
 //! LRU, and drawn either as real graphics through ratatui-image (sixel /
-//! kitty / iTerm2) or as text: quadrant or sextant block characters with
-//! two fitted colours per cell. Text is what survives multiplexers (herdr,
-//! Zellij), which only forward a character grid.
+//! kitty / iTerm2) or as text: half-block, quadrant or sextant characters
+//! with two fitted colours per cell. Text is what survives multiplexers
+//! (herdr, Zellij), which only forward a character grid. Half-blocks are the
+//! default text mode: they are in practically every font, unlike sextants.
+//! Without truecolor, text covers use the xterm 256-colour palette.
 //!
 //! `kitty+text` combines both for herdr: the text cover is drawn as usual and
 //! a Kitty direct placement is laid on top of it. herdr forwards the image
@@ -23,10 +25,13 @@ use std::{
     io::{Cursor, Read, Write},
     sync::mpsc::Sender,
     thread,
+    time::{Duration, Instant},
 };
 
 const MAX_CACHED: usize = 24;
 const MAX_PX: u32 = 360;
+/// A cover that failed to load is fetched again after this long.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Render slots: each keeps its own encoding so two sizes of the same cover
 /// don't re-encode every frame.
@@ -44,11 +49,13 @@ const OVERLAY_PX: u32 = 320;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Graphics(ProtocolType),
+    /// 1x2 pixels per cell ("▀" with fg = top, bg = bottom), in every font.
+    HalfBlocks,
     /// 2x2 pixels per cell (U+2596..U+259F), in every common font.
     Quadrants,
     /// 2x3 pixels per cell (U+1FB00..U+1FB3B, "legacy computing").
     Sextants,
-    /// Sextants with a Kitty image placed over them.
+    /// Half-blocks with a Kitty image placed over them.
     KittyText,
 }
 
@@ -66,9 +73,13 @@ pub struct Covers {
     auto: Mode,
     mode: Mode,
     cell: (u16, u16),
-    images: HashMap<String, Option<DynamicImage>>,
+    /// Text covers use 24-bit colour; otherwise the 256-colour palette.
+    truecolor: bool,
+    images: HashMap<String, DynamicImage>,
     order: VecDeque<String>,
     pending: HashSet<String>,
+    /// Keys whose last load failed, and when.
+    failed: HashMap<String, Instant>,
     slots: [Option<(String, Encoded)>; 2],
     /// Overlays wanted by the frame being drawn / currently on screen.
     frame: [Option<(String, Rect)>; 2],
@@ -82,10 +93,12 @@ impl Covers {
             auto,
             mode: auto,
             cell: cell_size(&picker),
+            truecolor: truecolor(),
             picker,
             images: HashMap::new(),
             order: VecDeque::new(),
             pending: HashSet::new(),
+            failed: HashMap::new(),
             slots: [None, None],
             frame: [None, None],
             placed: [None, None],
@@ -100,7 +113,7 @@ impl Covers {
             "kitty" => Mode::Graphics(ProtocolType::Kitty),
             "iterm2" => Mode::Graphics(ProtocolType::Iterm2),
             "sixel" => Mode::Graphics(ProtocolType::Sixel),
-            "halfblocks" => Mode::Graphics(ProtocolType::Halfblocks),
+            "halfblocks" => Mode::HalfBlocks,
             "quadrants" => Mode::Quadrants,
             "sextants" => Mode::Sextants,
             "kitty+text" => Mode::KittyText,
@@ -115,6 +128,7 @@ impl Covers {
     pub fn mode_name(&self) -> String {
         match self.mode {
             Mode::Graphics(p) => format!("{p:?}").to_lowercase(),
+            Mode::HalfBlocks => "halfblocks".into(),
             Mode::Quadrants => "quadrants".into(),
             Mode::Sextants => "sextants".into(),
             Mode::KittyText => "kitty+text".into(),
@@ -137,7 +151,7 @@ impl Covers {
                 let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
             }
             if let Some((key, r)) = &self.frame[slot] {
-                if let Some(Some(img)) = self.images.get(key) {
+                if let Some(img) = self.images.get(key) {
                     place_kitty(out, id, img, *r);
                 }
             }
@@ -153,42 +167,37 @@ impl Covers {
         if key.is_empty() || area.width == 0 || area.height == 0 {
             return false;
         }
-        let img = match self.images.get(key) {
-            Some(Some(img)) => img,
-            Some(None) => return false,
-            None => {
-                if self.pending.insert(key.to_string()) {
-                    let (key, tx) = (key.to_string(), tx.clone());
-                    thread::spawn(move || {
-                        let img = load(&key);
-                        let _ = tx.send(Msg::Art(key, img));
-                    });
-                }
-                return false;
-            }
-        };
+        // Covers on screen stay at the young end of the LRU, so scrolling
+        // through a long list doesn't evict the one that is playing.
+        if let Some(i) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(i).unwrap_or_default();
+            self.order.push_back(k);
+        }
         let fresh = match (&self.slots[slot], self.mode) {
             (Some((k, Encoded::Graphics(_))), Mode::Graphics(_)) => k != key,
-            (Some((k, Encoded::Text { area: a, .. })), Mode::Quadrants | Mode::Sextants | Mode::KittyText) => {
-                k != key || *a != area
-            }
+            (Some((k, Encoded::Text { area: a, .. })), m) if !matches!(m, Mode::Graphics(_)) => k != key || *a != area,
             _ => true,
         };
         if fresh {
+            let Some(img) = self.images.get(key) else {
+                self.fetch(key, tx);
+                return false;
+            };
             let enc = match self.mode {
                 Mode::Graphics(_) => Encoded::Graphics(self.picker.new_resize_protocol(img.clone())),
-                text => Encoded::Text { area, cells: text_cells(img, area, text, self.cell) },
+                text => Encoded::Text { area, cells: text_cells(img, area, text, self.cell, self.truecolor) },
             };
             self.slots[slot] = Some((key.to_string(), enc));
         }
+        let (r, cols) = text_rect(area, self.cell);
         match &mut self.slots[slot] {
             // Default is nearest-neighbour, which turns half-block covers
             // into noise; a real filter averages each cell's pixels.
+            // Drawn into the centred square: Fit alone pins it top-left.
             Some((_, Encoded::Graphics(p))) => {
-                f.render_stateful_widget(StatefulImage::default().resize(Resize::Fit(Some(FilterType::CatmullRom))), area, p)
+                f.render_stateful_widget(StatefulImage::default().resize(Resize::Fit(Some(FilterType::CatmullRom))), r, p)
             }
             Some((_, Encoded::Text { cells, .. })) => {
-                let (r, cols) = text_rect(area, self.cell);
                 let buf = f.buffer_mut();
                 for (i, (ch, fg, bg)) in cells.iter().enumerate() {
                     let (x, y) = (r.x + (i as u16 % cols), r.y + (i as u16 / cols));
@@ -203,8 +212,28 @@ impl Covers {
         true
     }
 
+    /// Start loading `key` unless it is already loading or failed recently.
+    fn fetch(&mut self, key: &str, tx: &Sender<Msg>) {
+        if self.failed.get(key).is_some_and(|t| t.elapsed() < RETRY_AFTER) || !self.pending.insert(key.to_string()) {
+            return;
+        }
+        let (key, tx) = (key.to_string(), tx.clone());
+        thread::spawn(move || {
+            let img = load(&key);
+            let _ = tx.send(Msg::Art(key, img));
+        });
+    }
+
     pub fn loaded(&mut self, key: String, img: Option<DynamicImage>) {
         self.pending.remove(&key);
+        let Some(img) = img else {
+            // Remembered for a while only: a network blip shouldn't leave
+            // the placeholder up for good.
+            self.failed.insert(key, Instant::now());
+            return;
+        };
+        self.failed.remove(&key);
+        self.order.retain(|k| *k != key);
         self.order.push_back(key.clone());
         self.images.insert(key, img);
         while self.order.len() > MAX_CACHED {
@@ -212,6 +241,52 @@ impl Covers {
                 self.images.remove(&old);
             }
         }
+    }
+
+    /// Columns a visually square cover `rows` cells tall needs.
+    pub fn cols_for_rows(&self, rows: u16) -> u16 {
+        let (fw, fh) = (self.cell.0.max(1) as u32, self.cell.1.max(1) as u32);
+        ((rows as u32 * fh + fw / 2) / fw).min(u16::MAX as u32) as u16
+    }
+
+    /// Rows a visually square cover `cols` cells wide needs.
+    pub fn rows_for_cols(&self, cols: u16) -> u16 {
+        let (fw, fh) = (self.cell.0.max(1) as u32, self.cell.1.max(1) as u32);
+        (cols as u32 * fw / fh).min(u16::MAX as u32) as u16
+    }
+}
+
+/// Whether the terminal takes 24-bit colour escapes. COLORTERM is the
+/// standard signal; Windows Terminal (WT_SESSION) and a few others don't
+/// always set it. Multiplexers keep the previous behaviour (truecolor).
+pub fn truecolor() -> bool {
+    let env = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase();
+    let term = env("TERM");
+    matches!(env("COLORTERM").as_str(), "truecolor" | "24bit")
+        || std::env::var_os("WT_SESSION").is_some()
+        || matches!(env("TERM_PROGRAM").as_str(), "wezterm" | "iterm.app" | "vscode" | "rio" | "ghostty")
+        || term.contains("kitty")
+        || term.ends_with("-direct")
+        || in_multiplexer()
+}
+
+/// Nearest xterm-256 colour: the 6x6x6 cube or the 24-step grey ramp.
+fn to_256(r: u8, g: u8, b: u8) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let idx = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { ((v - 35) / 40) as usize };
+    let (ri, gi, bi) = (idx(r), idx(g), idx(b));
+    let dist = |c: (u8, u8, u8)| {
+        let d = |a: u8, b: u8| (a as i32 - b as i32).pow(2);
+        d(c.0, r) + d(c.1, g) + d(c.2, b)
+    };
+    let cube = (LEVELS[ri], LEVELS[gi], LEVELS[bi]);
+    let avg = (r as u32 + g as u32 + b as u32) / 3;
+    let step = if avg > 238 { 23 } else { avg.saturating_sub(3) / 10 } as u8;
+    let grey = 8 + 10 * step;
+    if dist((grey, grey, grey)) < dist(cube) {
+        232 + step
+    } else {
+        16 + 36 * ri as u8 + 6 * gi as u8 + bi as u8
     }
 }
 
@@ -253,9 +328,13 @@ fn text_rect(area: Rect, (fw, fh): (u16, u16)) -> (Rect, u16) {
 
 /// Encode an image as block characters: each cell's sub-pixels are split
 /// into the two-colour partition with the least error.
-fn text_cells(img: &DynamicImage, area: Rect, mode: Mode, font: (u16, u16)) -> Vec<Cell> {
-    let mode = if mode == Mode::KittyText { Mode::Sextants } else { mode };
-    let (sx, sy) = if mode == Mode::Sextants { (2u32, 3u32) } else { (2, 2) };
+fn text_cells(img: &DynamicImage, area: Rect, mode: Mode, font: (u16, u16), truecolor: bool) -> Vec<Cell> {
+    let mode = if mode == Mode::KittyText { Mode::HalfBlocks } else { mode };
+    let (sx, sy) = match mode {
+        Mode::Sextants => (2u32, 3u32),
+        Mode::HalfBlocks => (1, 2),
+        _ => (2, 2),
+    };
     let (r, _) = text_rect(area, font);
     let (cols, rows) = (r.width as u32, r.height as u32);
     let px = img.resize_exact(cols * sx, rows * sy, FilterType::CatmullRom).to_rgb8();
@@ -271,10 +350,22 @@ fn text_cells(img: &DynamicImage, area: Rect, mode: Mode, font: (u16, u16)) -> V
             out.push(fit_cell(&p[..n], mode));
         }
     }
+    if !truecolor {
+        let q = |c: Color| match c {
+            Color::Rgb(r, g, b) => Color::Indexed(to_256(r, g, b)),
+            c => c,
+        };
+        out.iter_mut().for_each(|(_, fg, bg)| (*fg, *bg) = (q(*fg), q(*bg)));
+    }
     out
 }
 
 fn fit_cell(p: &[[f32; 3]], mode: Mode) -> Cell {
+    let rgb = |c: [f32; 3]| Color::Rgb(c[0] as u8, c[1] as u8, c[2] as u8);
+    if mode == Mode::HalfBlocks {
+        // Two pixels, two colours: exact, no fitting needed.
+        return ('▀', rgb(p[0]), rgb(p[1]));
+    }
     let n = p.len();
     let mean = |mask: u32, set: bool| {
         let (mut s, mut k) = ([0f32; 3], 0f32);
@@ -298,7 +389,6 @@ fn fit_cell(p: &[[f32; 3]], mode: Mode) -> Cell {
     };
     // The last sub-pixel always stays in the background group: halves the search.
     let best = (0..1u32 << (n - 1)).min_by(|&a, &b| err(a).total_cmp(&err(b))).unwrap_or(0);
-    let rgb = |c: [f32; 3]| Color::Rgb(c[0] as u8, c[1] as u8, c[2] as u8);
     let (fg, bg) = (rgb(mean(best, true)), rgb(mean(best, false)));
     if best == 0 {
         return (' ', bg, bg);
@@ -376,8 +466,10 @@ fn auto_mode(queried: ProtocolType) -> Mode {
         return Mode::Graphics(ProtocolType::Iterm2);
     }
     match queried {
-        // No graphics at all: text beats ratatui-image's half-blocks.
-        ProtocolType::Halfblocks => Mode::Sextants,
+        // No graphics at all: our own half-blocks (256-colour fallback,
+        // centred) beat ratatui-image's; sextants are opt-in since many
+        // fonts lack them and show empty boxes.
+        ProtocolType::Halfblocks => Mode::HalfBlocks,
         p => Mode::Graphics(p),
     }
 }
@@ -396,5 +488,22 @@ mod tests {
         // Top-left sub-pixel only: first sextant glyph.
         assert_eq!(fit_cell(&[r, b, b, b, b, b], Mode::Sextants).0, '\u{1FB00}');
         assert_eq!(fit_cell(&[r, b, r, b, r, b], Mode::Sextants).0, '▌');
+        assert_eq!(fit_cell(&[r, b], Mode::HalfBlocks), ('▀', Color::Rgb(255, 0, 0), Color::Rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn quantises_to_256() {
+        assert_eq!(to_256(0, 0, 0), 16);
+        assert_eq!(to_256(255, 255, 255), 231);
+        assert_eq!(to_256(255, 0, 0), 196);
+        assert_eq!(to_256(128, 128, 128), 244);
+        assert_eq!(to_256(255, 215, 175), 223);
+    }
+
+    #[test]
+    fn square_cover_in_cells() {
+        let (r, cols) = text_rect(Rect::new(0, 0, 40, 10), (8, 16));
+        assert_eq!((r.width, r.height, cols), (20, 10, 20));
+        assert_eq!(r.x, 10, "centred horizontally");
     }
 }

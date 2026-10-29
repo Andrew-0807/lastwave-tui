@@ -21,7 +21,40 @@ fn sign(params: &[(&str, String)], secret: &str) -> String {
     format!("{:x}", Md5::digest(s.as_bytes()))
 }
 
-fn call(mut params: Vec<(&str, String)>, secret: &str, post: bool) -> Result<Value, String> {
+/// A failed Last.fm call: the API error code (0 for network/HTTP trouble) and message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LfmError {
+    pub code: i64,
+    pub msg: String,
+}
+
+impl LfmError {
+    /// Error 9: the session key was revoked or expired; the user must reconnect.
+    pub fn bad_session(&self) -> bool {
+        self.code == 9
+    }
+
+    /// Worth sending again later: network trouble or a temporary Last.fm outage.
+    pub fn retryable(&self) -> bool {
+        matches!(self.code, 0 | 8 | 9 | 11 | 16 | 29)
+    }
+}
+
+impl std::fmt::Display for LfmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bad_session() {
+            f.write_str("Last.fm session expired — reconnect in Settings → Last.fm account")
+        } else {
+            f.write_str(&self.msg)
+        }
+    }
+}
+
+fn call(params: Vec<(&str, String)>, secret: &str, post: bool) -> Result<Value, String> {
+    call_coded(params, secret, post).map_err(|e| e.to_string())
+}
+
+fn call_coded(mut params: Vec<(&str, String)>, secret: &str, post: bool) -> Result<Value, LfmError> {
     let sig = sign(&params, secret);
     params.push(("api_sig", sig));
     params.push(("format", "json".into()));
@@ -35,16 +68,18 @@ fn call(mut params: Vec<(&str, String)>, secret: &str, post: bool) -> Result<Val
         }
         req.call()
     };
+    let net = |msg: String| LfmError { code: 0, msg };
     let v: Value = match res {
-        Ok(r) => r.into_json().map_err(|e| e.to_string())?,
+        Ok(r) => r.into_json().map_err(|e| net(e.to_string()))?,
         Err(ureq::Error::Status(code, r)) => r.into_json().unwrap_or_else(|_| Value::from(format!("HTTP {code}"))),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(net(e.to_string())),
     };
-    if let Some(msg) = v["message"].as_str().filter(|_| v.get("error").is_some()) {
-        return Err(format!("Last.fm: {msg}"));
+    if let Some(code) = v.get("error") {
+        let msg = v["message"].as_str().unwrap_or("unknown error");
+        return Err(LfmError { code: code.as_i64().unwrap_or(-1), msg: format!("Last.fm: {msg}") });
     }
     if let Some(s) = v.as_str() {
-        return Err(s.to_string());
+        return Err(net(s.to_string()));
     }
     Ok(v)
 }
@@ -89,14 +124,40 @@ fn track_params<'a>(t: &Track, key: &str, sk: &str, method: &'a str) -> Vec<(&'a
     p
 }
 
-pub fn now_playing(key: &str, secret: &str, sk: &str, t: &Track) -> Result<(), String> {
-    call(track_params(t, key, sk, "track.updateNowPlaying"), secret, true).map(|_| ())
+pub fn now_playing(key: &str, secret: &str, sk: &str, t: &Track) -> Result<(), LfmError> {
+    call_coded(track_params(t, key, sk, "track.updateNowPlaying"), secret, true).map(|_| ())
 }
 
-pub fn scrobble(key: &str, secret: &str, sk: &str, t: &Track, started_unix: u64) -> Result<(), String> {
+/// `Ok(None)`: accepted. `Ok(Some(reason))`: Last.fm took the request but
+/// ignored the scrobble (filtered artist, bad timestamp, daily limit…).
+pub fn scrobble(key: &str, secret: &str, sk: &str, t: &Track, started_unix: u64) -> Result<Option<String>, LfmError> {
     let mut p = track_params(t, key, sk, "track.scrobble");
     p.push(("timestamp", started_unix.to_string()));
-    call(p, secret, true).map(|_| ())
+    call_coded(p, secret, true).map(|v| ignored_reason(&v))
+}
+
+/// Why a `track.scrobble` reply was not counted, if it wasn't.
+fn ignored_reason(v: &Value) -> Option<String> {
+    let s = &v["scrobbles"];
+    let num = |x: &Value| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok()));
+    let accepted = num(&s["@attr"]["accepted"]);
+    // A batch reply holds an array; a single scrobble an object.
+    let one = if s["scrobble"].is_array() { &s["scrobble"][0] } else { &s["scrobble"] };
+    let msg = &one["ignoredMessage"];
+    let code = num(&msg["code"]).unwrap_or(0);
+    if code == 0 && accepted != Some(0) {
+        return None;
+    }
+    let text = msg["#text"].as_str().unwrap_or_default().trim();
+    let why = match code {
+        1 => "artist was filtered",
+        2 => "track was filtered",
+        3 => "timestamp too old",
+        4 => "timestamp too new",
+        5 => "daily scrobble limit reached",
+        _ => "not accepted",
+    };
+    Some(if text.is_empty() { why.to_string() } else { format!("{why}: {text}") })
 }
 
 pub fn open_url(url: &str) {
@@ -108,4 +169,30 @@ pub fn open_url(url: &str) {
     #[cfg(all(unix, not(target_os = "macos")))]
     let r = Command::new("xdg-open").arg(url).spawn();
     let _ = r;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn scrobble_reply_parsing() {
+        let ok = json!({"scrobbles": {"@attr": {"accepted": 1, "ignored": 0},
+            "scrobble": {"ignoredMessage": {"code": "0", "#text": ""}}}});
+        assert_eq!(ignored_reason(&ok), None);
+        let ignored = json!({"scrobbles": {"@attr": {"accepted": 0, "ignored": 1},
+            "scrobble": {"ignoredMessage": {"code": "1", "#text": "Artist name failed filter"}}}});
+        assert_eq!(ignored_reason(&ignored).as_deref(), Some("artist was filtered: Artist name failed filter"));
+        let none = json!({"scrobbles": {"@attr": {"accepted": "0", "ignored": "1"}, "scrobble": {}}});
+        assert_eq!(ignored_reason(&none).as_deref(), Some("not accepted"));
+    }
+
+    #[test]
+    fn error_classes() {
+        let e = |code| LfmError { code, msg: String::new() };
+        assert!(e(9).bad_session() && e(9).retryable());
+        assert!(e(0).retryable() && e(16).retryable() && e(29).retryable());
+        assert!(!e(6).retryable() && !e(13).retryable());
+    }
 }

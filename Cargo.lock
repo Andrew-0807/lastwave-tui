@@ -545,6 +545,7 @@ dependencies = [
  "sha1",
  "ureq",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

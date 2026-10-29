@@ -18,9 +18,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 sha1 = "0.10"
 base64 = "0.22"
 
+[target.'cfg(windows)'.dependencies]
+# Job object so mpv dies with us even if the console window is closed.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# Unwind (the default) so a panic in a background thread only ends that
+# thread instead of the whole app.

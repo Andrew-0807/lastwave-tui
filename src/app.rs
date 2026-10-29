@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::mpsc::Sender,
+    sync::mpsc::{self, Sender},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -53,14 +53,18 @@ fn read_clipboard() -> Result<String, String> {
 pub enum Msg {
     Mpv(MpvEvent),
     Search(u64, Result<Results, String>),
-    /// (opened from the Library view?, page, tracks)
-    Browse(bool, Collection, Result<Vec<Track>, String>),
+    /// (request id, opened from the Library view?, page, tracks)
+    Browse(u64, bool, Collection, Result<Vec<Track>, String>),
     Home(Result<Vec<Shelf>, String>),
     YtLogin(Result<(String, String), String>),
     YtLists(Result<Vec<Collection>, String>),
-    Radio(Result<Vec<Track>, String>),
+    /// (request id, tracks)
+    Radio(u64, Result<Vec<Track>, String>),
+    /// mpv finished starting in the background: (player, audio devices).
+    MpvReady(Result<(Mpv, Vec<(String, String)>), String>),
+    Scrobbled(ScrobbleReport),
     Lyrics(String, Option<Lyrics>),
-    Library(Vec<Track>),
+    Library(Result<Vec<Track>, String>),
     Status(String),
     LfmToken(Result<String, String>),
     LfmSession(Result<(String, String), String>),
@@ -73,6 +77,70 @@ pub enum Msg {
     /// (playlist title, browse id of the playlist added to)
     Added(String, Result<String, String>),
 }
+
+/// Outcome of sending queued scrobbles, in order.
+#[derive(Default)]
+pub struct ScrobbleReport {
+    accepted: Vec<Track>,
+    /// Taken by Last.fm but not counted, or refused for good: (track, why).
+    ignored: Vec<(Track, String)>,
+    /// Not sent because of a temporary error; retried later.
+    unsent: Vec<(Track, u64)>,
+    error: Option<lastfm::LfmError>,
+}
+
+/// Send scrobbles oldest first, stopping at the first temporary failure.
+fn submit_scrobbles(k: &str, s: &str, sk: &str, items: Vec<(Track, u64)>) -> ScrobbleReport {
+    let mut r = ScrobbleReport::default();
+    let mut it = items.into_iter();
+    for (t, ts) in it.by_ref() {
+        match lastfm::scrobble(k, s, sk, &t, ts) {
+            Ok(None) => r.accepted.push(t),
+            Ok(Some(why)) => r.ignored.push((t, why)),
+            Err(e) if e.retryable() => {
+                r.unsent.push((t, ts));
+                r.error = Some(e);
+                break;
+            }
+            Err(e) => r.ignored.push((t, e.to_string())),
+        }
+    }
+    r.unsent.extend(it);
+    r
+}
+
+/// Last.fm's rule: the track is longer than 30s and was played for half
+/// its length or 4 minutes. `length` is 0 when unknown; a track that played
+/// to its end then counts as long as what was heard.
+pub(crate) fn scrobble_eligible(length: f64, played: f64, ended: bool) -> bool {
+    let length = if length > 0.0 { length } else if ended { played } else { 0.0 };
+    if length <= 0.0 {
+        return played >= 240.0;
+    }
+    length > 30.0 && (played >= length / 2.0 || played >= 240.0)
+}
+
+/// The queue to go back to on undo, kept consistent with what is playing:
+/// the playing song stays current, put back after the old current one if
+/// the old queue doesn't hold it.
+fn restore_queue(mut q: Vec<Track>, old_cur: Option<usize>, playing: Option<&Track>) -> (Vec<Track>, Option<usize>) {
+    let Some(p) = playing else { return (q, None) };
+    let url = p.url();
+    if let Some(c) = old_cur.filter(|&c| q.get(c).is_some_and(|t| t.url() == url)) {
+        return (q, Some(c));
+    }
+    if let Some(i) = q.iter().position(|t| t.url() == url) {
+        return (q, Some(i));
+    }
+    let at = old_cur.map_or(q.len(), |c| (c + 1).min(q.len()));
+    q.insert(at, p.clone());
+    (q, Some(at))
+}
+
+const UNDO_DEPTH: usize = 10;
+const MAX_PENDING_SCROBBLES: usize = 1000;
+/// Songs in a row that may fail to load before playback stops.
+const MAX_FAILS: u32 = 5;
 
 /// One row of the Discover list.
 #[derive(Clone, Serialize, Deserialize)]
@@ -171,6 +239,7 @@ pub const SETTINGS: &[&str] = &[
     "Hide AI songs in Discover",
 ];
 
+const SET_LFM_ACCOUNT: usize = 9;
 const SET_YT_ACCOUNT: usize = 10;
 
 pub struct App {
@@ -182,6 +251,8 @@ pub struct App {
     pub input_buf: String,
     pub help: bool,
     pub quit: bool,
+    /// Something visible changed since the last draw.
+    pub dirty: bool,
     pub status: String,
 
     pub query: String,
@@ -203,7 +274,12 @@ pub struct App {
     radio_busy: bool,
 
     pub library: Vec<Track>,
-    pub lib_filter: String,
+    /// Set through `set_lib_filter` so `lib_vis` stays in step.
+    lib_filter: String,
+    /// "title artist album" of each library track, lowercased once at load.
+    lib_search: Vec<String>,
+    /// Indices into `library` that match `lib_filter`.
+    lib_vis: Vec<usize>,
     pub lib_sel: ListState,
     pub lib_scanning: bool,
     pub lib_mode: LibMode,
@@ -249,7 +325,33 @@ pub struct App {
     played: f64,
     last_pos: f64,
     started_at: u64,
-    finished: bool,
+    /// The song whose scrobble is pending (taken when it finishes).
+    playing: Option<Track>,
+    /// Length mpv reported for the playing song (0 = unknown).
+    track_len: f64,
+    /// mpv reached the end of the playing song; its stats are frozen.
+    ended: bool,
+    /// The queue ran out: the last song ended with nothing after it.
+    at_end: bool,
+    /// The gapless advance was seen via `path` first; the old file's eof is still to come.
+    skip_eof: bool,
+    fail_streak: u32,
+    scrobble_queue: Vec<(Track, u64)>,
+    /// Scrobbles being sent: the thread (returns what it couldn't send) and
+    /// a copy of what it was given, kept in case it doesn't finish by exit.
+    scrobble_job: Option<(thread::JoinHandle<config::PendingScrobbles>, config::PendingScrobbles)>,
+    lfm_bad_session: bool,
+
+    queue_undo: Vec<(Vec<Track>, Option<usize>)>,
+    /// Settings row whose sign-out waits for a second Enter.
+    confirm_signout: Option<usize>,
+    /// mpv could not start / exited; kept at the front of the status line.
+    mpv_error: Option<String>,
+    mpv_starting: bool,
+    /// Play `cur` once mpv is up.
+    pending_play: bool,
+    browse_seq: u64,
+    radio_seq: u64,
 }
 
 fn now() -> u64 {
@@ -294,6 +396,7 @@ impl App {
             input_buf: String::new(),
             help: false,
             quit: false,
+            dirty: true,
             status: "Press / to search, ? for keys".into(),
             query: String::new(),
             kind: Kind::Songs,
@@ -313,6 +416,8 @@ impl App {
             radio_busy: false,
             library: Vec::new(),
             lib_filter: String::new(),
+            lib_search: Vec::new(),
+            lib_vis: Vec::new(),
             lib_sel: ListState::default(),
             lib_scanning: false,
             lib_mode: LibMode::Local,
@@ -350,14 +455,33 @@ impl App {
             played: 0.0,
             last_pos: 0.0,
             started_at: 0,
-            finished: true,
+            playing: None,
+            track_len: 0.0,
+            ended: false,
+            at_end: false,
+            skip_eof: false,
+            fail_streak: 0,
+            scrobble_queue: Vec::new(),
+            scrobble_job: None,
+            lfm_bad_session: false,
+            queue_undo: Vec::new(),
+            confirm_signout: None,
+            mpv_error: None,
+            mpv_starting: false,
+            pending_play: false,
+            browse_seq: 0,
+            radio_seq: 0,
         }
     }
 
     pub fn start(&mut self) {
-        match Mpv::spawn(&self.cfg, self.tx.clone()) {
-            Ok(m) => {
-                self.devices = m
+        // mpv can take seconds to come up; start it off the UI thread so the
+        // first frame draws right away.
+        self.mpv_starting = true;
+        let (cfg, tx) = (self.cfg.clone(), self.tx.clone());
+        self.spawn(move || {
+            Msg::MpvReady(Mpv::spawn(&cfg, tx).map(|m| {
+                let devices = m
                     .get("audio-device-list")
                     .and_then(|v| v.as_array().cloned())
                     .unwrap_or_default()
@@ -369,11 +493,13 @@ impl App {
                         )
                     })
                     .collect();
-                self.mpv = Some(m);
-            }
-            Err(e) => self.status = e,
-        }
+                (m, devices)
+            }))
+        });
         self.rescan();
+        // Scrobbles a previous run couldn't send.
+        self.scrobble_queue = config::load_scrobbles(MAX_PENDING_SCROBBLES);
+        self.flush_scrobbles();
         // Loaded even with skipping off: the [AI] marks use it too.
         if aifilter::load_cached() {
             self.spawn(|| Msg::AiList(aifilter::refresh()));
@@ -546,9 +672,11 @@ impl App {
             self.searching = true;
         }
         self.status = format!("Opening {}…", c.title);
+        self.browse_seq += 1;
+        let seq = self.browse_seq;
         self.spawn(move || {
             let r = ytm::browse(&c.browse_id);
-            Msg::Browse(lib, c, r)
+            Msg::Browse(seq, lib, c, r)
         });
     }
 
@@ -604,18 +732,53 @@ impl App {
         } else {
             self.input_buf.push_str(&text.replace(['\r', '\n'], " "));
             if target == Input::LibFilter {
-                self.lib_filter = self.input_buf.clone();
+                self.set_lib_filter(self.input_buf.clone());
             }
         }
     }
 
+    /// Save state, stop mpv and send pending scrobbles (waiting up to ~3s).
     pub fn shutdown(&mut self) {
-        self.finish_track();
+        self.queue_scrobble();
         self.cfg.volume = self.volume;
         self.cfg.save();
         State { queue: self.queue.clone(), cur: self.cur }.save();
         if let Some(m) = &mut self.mpv {
             m.quit();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // Scrobbles already on their way: let them land.
+        if let Some((job, sent)) = self.scrobble_job.take() {
+            while !job.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            // Its report never reaches on_scrobbled now; take what it left.
+            let unsent = if job.is_finished() { job.join().unwrap_or(sent) } else { sent };
+            self.scrobble_queue.splice(0..0, unsent);
+        }
+        if !self.scrobble_queue.is_empty() && self.lfm_ready() && !self.lfm_bad_session {
+            let items = std::mem::take(&mut self.scrobble_queue);
+            let sent = items.clone();
+            let (k, s, sk) = self.lfm_creds();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(submit_scrobbles(&k, &s, &sk, items));
+            });
+            let left = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            // Not answered in time: keep them all (a repeat beats a lost scrobble).
+            self.scrobble_queue = left.map(|r| r.unsent).unwrap_or(sent);
+        }
+        // Whatever is still unsent is retried next run.
+        let extra = self.scrobble_queue.len().saturating_sub(MAX_PENDING_SCROBBLES);
+        self.scrobble_queue.drain(..extra);
+        config::save_scrobbles(&self.scrobble_queue);
+    }
+
+    /// Keep an mpv failure visible: routine messages go after it.
+    fn keep_sticky(&mut self) {
+        let Some(e) = &self.mpv_error else { return };
+        if !self.status.starts_with(e.as_str()) {
+            self.status = if self.status.is_empty() { e.clone() } else { format!("{e} · {}", self.status) };
         }
     }
 
@@ -689,13 +852,74 @@ impl App {
     fn play_index(&mut self, i: usize) {
         let Some(url) = self.queue.get(i).map(Track::url) else { return };
         self.finish_track();
+        // The cursor follows playback only if it was on the playing song.
+        if self.cur.is_none() || self.queue_sel.selected().is_none() || self.queue_sel.selected() == self.cur {
+            self.queue_sel.select(Some(i));
+        }
+        self.cur = Some(i);
+        self.at_end = false;
+        self.skip_eof = false;
+        if self.mpv.is_none() {
+            self.pending_play = self.mpv_starting;
+            self.status = if self.mpv_starting { "Starting mpv…".into() } else { "mpv is not running".into() };
+            return;
+        }
         self.mpv_cmd(json!(["loadfile", url, "replace"]));
         self.mpv_set("pause", false);
         self.mpv_next = None;
-        self.cur = Some(i);
-        self.queue_sel.select(Some(i));
         self.on_track_start();
         self.sync_next();
+    }
+
+    /// mpv moved on to the prefetched entry `n` (gapless advance).
+    fn advance_to(&mut self, n: usize) {
+        let Some(c) = self.cur else { return };
+        self.finish_track();
+        self.note_skipped(n.saturating_sub(c + 1));
+        if self.queue_sel.selected() == Some(c) {
+            self.queue_sel.select(Some(n));
+        }
+        self.cur = Some(n);
+        self.mpv_cmd(json!(["playlist-remove", 0]));
+        self.mpv_next = None;
+        self.on_track_start();
+        self.sync_next();
+    }
+
+    /// After the queue ran out, start whatever has been added since.
+    fn resume_if_ended(&mut self) {
+        if self.at_end && self.idle && self.mpv.is_some() && self.cur.and_then(|c| self.next_playable(c + 1)).is_some() {
+            self.next();
+        }
+    }
+
+    /// Remember the queue before a change that replaces or shortens it.
+    fn snapshot_queue(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        if self.queue_undo.len() >= UNDO_DEPTH {
+            self.queue_undo.remove(0);
+        }
+        self.queue_undo.push((self.queue.clone(), self.cur));
+    }
+
+    fn undo_queue(&mut self) {
+        let Some((q, old_cur)) = self.queue_undo.pop() else {
+            self.status = "Nothing to undo".into();
+            return;
+        };
+        let playing = self.current().cloned();
+        let (q, cur) = restore_queue(q, old_cur, playing.as_ref());
+        self.queue = q;
+        self.cur = cur;
+        self.queue_sel.select(cur.or((!self.queue.is_empty()).then_some(0)));
+        // Radio asked for the replaced queue no longer applies.
+        self.radio_seq += 1;
+        self.radio_busy = false;
+        self.sync_next();
+        self.status = format!("Queue restored ({} tracks)", self.queue.len());
+        self.resume_if_ended();
     }
 
     /// Keep mpv's playlist as [current, next] so gapless + prefetch work.
@@ -717,9 +941,13 @@ impl App {
         self.dur = 0.0;
         self.played = 0.0;
         self.last_pos = 0.0;
+        self.track_len = 0.0;
+        self.ended = false;
+        self.at_end = false;
         self.started_at = now();
-        self.finished = false;
+        self.playing = self.current().cloned();
         let Some(t) = self.current().cloned() else { return };
+        self.flush_scrobbles();
 
         self.lyrics = None;
         self.lyrics_loading = true;
@@ -728,12 +956,12 @@ impl App {
         let lt = t.clone();
         self.spawn(move || Msg::Lyrics(key, lyrics::fetch(&lt)));
 
-        if self.lfm_ready() {
+        if self.lfm_ready() && !self.lfm_bad_session {
             let (k, s, sk) = self.lfm_creds();
             let nt = t.clone();
             self.spawn(move || match lastfm::now_playing(&k, &s, &sk, &nt) {
                 Ok(()) => Msg::Status(String::new()),
-                Err(e) => Msg::Status(e),
+                Err(e) => Msg::Status(e.to_string()),
             });
         }
         self.maybe_radio();
@@ -745,31 +973,89 @@ impl App {
             return;
         }
         let Some(id) = self.queue[c].video_id().map(str::to_string) else { return };
-        self.radio_busy = true;
-        self.spawn(move || Msg::Radio(ytm::radio(&id)));
+        self.request_radio(id);
     }
 
-    /// Scrobble rule: >30s track, played half or 4 minutes.
+    fn request_radio(&mut self, id: String) {
+        self.radio_busy = true;
+        self.radio_seq += 1;
+        let seq = self.radio_seq;
+        self.spawn(move || Msg::Radio(seq, ytm::radio(&id)));
+    }
+
     fn finish_track(&mut self) {
-        if self.finished {
+        self.queue_scrobble();
+        self.flush_scrobbles();
+    }
+
+    /// Queue the song that was playing for scrobbling if it qualifies.
+    fn queue_scrobble(&mut self) {
+        let Some(mut t) = self.playing.take() else { return };
+        let len = if self.track_len > 0.0 { self.track_len } else { t.duration as f64 };
+        if !self.lfm_ready() || !scrobble_eligible(len, self.played, self.ended) {
             return;
         }
-        self.finished = true;
-        let Some(t) = self.current().cloned() else { return };
-        let dur = if self.dur > 0.0 { self.dur } else { t.duration as f64 };
-        if !self.lfm_ready() || dur < 30.0 || (self.played < dur / 2.0 && self.played < 240.0) {
-            return;
-        }
-        let mut t = t;
         if t.duration == 0 {
-            t.duration = dur as u32;
+            t.duration = if len > 0.0 { len } else { self.played } as u32;
         }
+        if self.scrobble_queue.len() >= MAX_PENDING_SCROBBLES {
+            self.scrobble_queue.remove(0);
+        }
+        self.scrobble_queue.push((t, self.started_at));
+    }
+
+    /// Send queued scrobbles (the new one plus any that failed before).
+    fn flush_scrobbles(&mut self) {
+        if self.scrobble_job.as_ref().is_some_and(|(j, _)| !j.is_finished())
+            || self.scrobble_queue.is_empty()
+            || !self.lfm_ready()
+            || self.lfm_bad_session
+        {
+            return;
+        }
+        let items = std::mem::take(&mut self.scrobble_queue);
+        let sent = items.clone();
         let (k, s, sk) = self.lfm_creds();
-        let ts = self.started_at;
-        self.spawn(move || match lastfm::scrobble(&k, &s, &sk, &t, ts) {
-            Ok(()) => Msg::Status(format!("Scrobbled: {} — {}", t.artist, t.title)),
-            Err(e) => Msg::Status(e),
+        let tx = self.tx.clone();
+        let job = thread::spawn(move || {
+            let r = submit_scrobbles(&k, &s, &sk, items);
+            let unsent = r.unsent.clone();
+            let _ = tx.send(Msg::Scrobbled(r));
+            unsent
         });
+        self.scrobble_job = Some((job, sent));
+    }
+
+    fn on_scrobbled(&mut self, r: ScrobbleReport) {
+        self.scrobble_job = None;
+        let n_unsent = r.unsent.len();
+        let mut q = r.unsent;
+        q.append(&mut self.scrobble_queue);
+        self.scrobble_queue = q;
+        let waiting = |n: usize| if n == 1 { "1 scrobble waiting".to_string() } else { format!("{n} scrobbles waiting") };
+        match &r.error {
+            Some(e) if e.bad_session() => {
+                self.lfm_bad_session = true;
+                self.status = format!("{e} ({})", waiting(self.scrobble_queue.len()));
+                return;
+            }
+            Some(e) => {
+                self.status = format!("Scrobble failed: {e} — {}, retrying with the next song", waiting(self.scrobble_queue.len()));
+                return;
+            }
+            None => {}
+        }
+        if let Some((t, why)) = r.ignored.last() {
+            self.status = format!("Last.fm ignored {} — {} ({why})", t.artist, t.title);
+        } else if let Some(t) = r.accepted.last() {
+            let more = r.accepted.len() - 1;
+            let more = if more > 0 { format!(" (+{more} earlier)") } else { String::new() };
+            self.status = format!("Scrobbled: {} — {}{more}", t.artist, t.title);
+        }
+        if n_unsent == 0 && !r.accepted.is_empty() {
+            // Last.fm is reachable again: send what queued up meanwhile.
+            self.flush_scrobbles();
+        }
     }
 
     fn lfm_ready(&self) -> bool {
@@ -799,9 +1085,16 @@ impl App {
             return;
         }
         self.finish_track();
+        let had = !self.queue.is_empty();
+        self.snapshot_queue();
         self.queue = tracks;
         self.cur = None;
+        self.radio_seq += 1;
+        self.radio_busy = false;
         self.play_index(start);
+        if had {
+            self.status = "Queue replaced — u to undo".into();
+        }
     }
 
     /// Insert right after the current track (or at the end when idle).
@@ -812,6 +1105,7 @@ impl App {
         self.queue.splice(at..at, tracks);
         self.sync_next();
         self.status = format!("{n} track{} will play next{}", if n == 1 { "" } else { "s" }, ai_left_out(ai));
+        self.resume_if_ended();
     }
 
     pub fn append(&mut self, tracks: Vec<Track>) {
@@ -820,15 +1114,15 @@ impl App {
         self.queue.extend(tracks);
         self.sync_next();
         self.status = format!("Added {n} track{} to queue{}", if n == 1 { "" } else { "s" }, ai_left_out(ai));
+        self.resume_if_ended();
     }
 
     fn start_radio(&mut self, t: Track) {
+        let had = !self.queue.is_empty();
         self.play_list(vec![t], 0);
-        self.radio_busy = false;
         if let Some(id) = self.queue[0].video_id().map(str::to_string) {
-            self.radio_busy = true;
-            self.status = "Starting radio…".into();
-            self.spawn(move || Msg::Radio(ytm::radio(&id)));
+            self.request_radio(id);
+            self.status = if had { "Starting radio… (u to undo)" } else { "Starting radio…" }.into();
         }
     }
 
@@ -843,11 +1137,14 @@ impl App {
             self.status = "Radio needs a YouTube song".into();
             return;
         };
+        let cut = self.queue.len() > c + 1;
+        if cut {
+            self.snapshot_queue();
+        }
         self.queue.truncate(c + 1);
         self.sync_next();
-        self.radio_busy = true;
-        self.status = "Starting radio…".into();
-        self.spawn(move || Msg::Radio(ytm::radio(&id)));
+        self.request_radio(id);
+        self.status = if cut { "Starting radio… (u to undo)" } else { "Starting radio…" }.into();
     }
 
     fn next(&mut self) {
@@ -923,6 +1220,7 @@ impl App {
 
     /// Remove AI tracks from the queue, except the current one.
     fn drop_ai_from_queue(&mut self) -> usize {
+        self.snapshot_queue();
         let before = self.queue.len();
         let cur = self.cur;
         let keep: Vec<bool> = self.queue.iter().enumerate().map(|(i, t)| Some(i) == cur || !self.is_ai(t)).collect();
@@ -939,6 +1237,9 @@ impl App {
         self.queue = q;
         self.cur = new_cur;
         nav(&mut self.queue_sel, self.queue.len(), 0);
+        if before == self.queue.len() {
+            self.queue_undo.pop();
+        }
         before - self.queue.len()
     }
 
@@ -950,8 +1251,18 @@ impl App {
     }
 
     fn toggle_pause(&mut self) {
+        if self.mpv.is_none() {
+            self.pending_play = self.mpv_starting && self.cur.is_some();
+            self.status = if self.mpv_starting { "Starting mpv…".into() } else { "mpv is not running".into() };
+            return;
+        }
         if self.idle {
-            let from = self.cur.unwrap_or(0);
+            // After the queue ran out, go on with anything added since;
+            // with nothing after it, play the last song again.
+            let from = match self.cur {
+                Some(c) if self.at_end && self.next_playable(c + 1).is_some() => c + 1,
+                c => c.unwrap_or(0),
+            };
             match self.next_playable(from) {
                 Some(i) => {
                     self.play_index(i);
@@ -970,13 +1281,18 @@ impl App {
             return;
         }
         let was_current = self.cur == Some(i);
+        if was_current {
+            // Before the queue shifts: the scrobble is for this song.
+            self.finish_track();
+        }
+        self.snapshot_queue();
         self.queue.remove(i);
+        self.status = "Removed — u to undo".into();
         match self.cur {
             Some(c) if c > i => self.cur = Some(c - 1),
             _ => {}
         }
         if was_current {
-            self.finish_track();
             match self.next_playable(i) {
                 Some(n) => {
                     self.play_index(n);
@@ -1050,23 +1366,43 @@ impl App {
 
     fn rescan(&mut self) {
         let dir = PathBuf::from(&self.cfg.library_dir);
-        if self.cfg.library_dir.is_empty() || !dir.is_dir() {
+        if self.cfg.library_dir.is_empty() {
+            return;
+        }
+        if let Err(e) = library::check_dir(&dir) {
+            self.status = e;
             return;
         }
         self.lib_scanning = true;
-        self.spawn(move || Msg::Library(library::scan(&dir)));
+        self.spawn(move || Msg::Library(library::try_scan(&dir)));
     }
 
-    pub fn lib_visible(&self) -> Vec<usize> {
+    /// Library tracks matching the filter (indices into `library`), cached.
+    pub fn lib_visible(&self) -> &[usize] {
+        &self.lib_vis
+    }
+
+    pub fn lib_filter(&self) -> &str {
+        &self.lib_filter
+    }
+
+    pub fn set_lib_filter(&mut self, f: String) {
+        if f != self.lib_filter {
+            self.lib_filter = f;
+            self.refilter_library();
+        }
+    }
+
+    fn set_library(&mut self, l: Vec<Track>) {
+        self.lib_search = l.iter().map(|t| format!("{} {} {}", t.title, t.artist, t.album).to_lowercase()).collect();
+        self.library = l;
+        self.refilter_library();
+    }
+
+    fn refilter_library(&mut self) {
         let f = self.lib_filter.to_lowercase();
         let words: Vec<&str> = f.split_whitespace().collect();
-        (0..self.library.len())
-            .filter(|&i| {
-                let t = &self.library[i];
-                let hay = format!("{} {} {}", t.title, t.artist, t.album).to_lowercase();
-                words.iter().all(|w| hay.contains(w))
-            })
-            .collect()
+        self.lib_vis = (0..self.library.len()).filter(|&i| words.iter().all(|w| self.lib_search[i].contains(w))).collect();
     }
 
     fn run_search(&mut self) {
@@ -1074,6 +1410,8 @@ impl App {
             return;
         }
         self.search_seq += 1;
+        // A page still loading would cover these results when it lands.
+        self.browse_seq += 1;
         self.searching = true;
         self.browse = None;
         let (seq, q, kind) = (self.search_seq, self.query.clone(), self.kind);
@@ -1138,8 +1476,38 @@ impl App {
     // ---- events ---------------------------------------------------------------
 
     pub fn on_msg(&mut self, m: Msg) {
+        // mpv reports these many times a second; the periodic redraw shows them.
+        let frequent = matches!(&m, Msg::Mpv(MpvEvent::Prop(n, _)) if n == "time-pos" || n == "audio-bitrate");
+        let status = frequent.then(|| self.status.clone());
+        self.handle_msg(m);
+        self.keep_sticky();
+        if status.is_none_or(|s| s != self.status) {
+            self.dirty = true;
+        }
+    }
+
+    fn handle_msg(&mut self, m: Msg) {
         match m {
             Msg::Mpv(ev) => self.on_mpv(ev),
+            Msg::MpvReady(r) => {
+                self.mpv_starting = false;
+                match r {
+                    Ok((m, devices)) => {
+                        self.devices = devices;
+                        self.mpv = Some(m);
+                        if std::mem::take(&mut self.pending_play) {
+                            if let Some(c) = self.cur {
+                                self.play_index(c);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.pending_play = false;
+                        self.mpv_error = Some(e);
+                    }
+                }
+            }
+            Msg::Scrobbled(r) => self.on_scrobbled(r),
             Msg::Search(seq, r) if seq == self.search_seq => {
                 self.searching = false;
                 match r {
@@ -1156,18 +1524,28 @@ impl App {
                 }
             }
             Msg::Search(..) => {}
-            Msg::Browse(lib, c, r) => {
-                self.searching = false;
-                self.yt_loading = false;
+            Msg::Browse(seq, lib, c, r) => {
+                let fresh = seq == self.browse_seq;
+                if fresh {
+                    self.searching = false;
+                    self.yt_loading = false;
+                }
+                // A page opened before something else: keep a library copy, drop the rest.
+                if !fresh && (!lib || r.is_err()) {
+                    return;
+                }
                 match r {
                     Ok(mut t) => {
                         ytm::fill_from_collection(&mut t, &c);
-                        self.status = format!("{}: {} tracks", c.title, t.len());
+                        if fresh {
+                            self.status = format!("{}: {} tracks", c.title, t.len());
+                        }
                         let first = (!t.is_empty()).then_some(0);
                         if lib {
                             // A refresh of what's already on screen keeps the cursor.
                             let same = self.yt_open.as_ref().is_some_and(|(o, _)| o.browse_id == c.browse_id);
-                            if !same || self.yt_open_sel.selected().is_none_or(|i| i >= t.len()) {
+                            let show = same || (fresh && self.yt_open.is_none());
+                            if show && (!same || self.yt_open_sel.selected().is_none_or(|i| i >= t.len())) {
                                 self.yt_open_sel.select(first);
                             }
                             if self.cache.pages.len() >= MAX_CACHED_PAGES && !self.cache.pages.contains_key(&c.browse_id) {
@@ -1177,7 +1555,7 @@ impl App {
                             }
                             self.cache.pages.insert(c.browse_id.clone(), t.clone());
                             // Only replace the view if the user is still on it (or on the list).
-                            if same || self.yt_open.is_none() {
+                            if show {
                                 self.yt_open = Some((c, t));
                             }
                             self.save_cache();
@@ -1235,7 +1613,9 @@ impl App {
                     Err(e) => self.status = format!("Could not load playlists: {e}"),
                 }
             }
-            Msg::Radio(r) => {
+            // Radio for a queue that has been replaced since.
+            Msg::Radio(seq, _) if seq != self.radio_seq => {}
+            Msg::Radio(_, r) => {
                 self.radio_busy = false;
                 match r {
                     Ok(tracks) => {
@@ -1250,6 +1630,7 @@ impl App {
                             0 => format!("Radio: +{n} tracks"),
                             ai => format!("Radio: +{n} tracks ({ai} AI-generated left out)"),
                         };
+                        self.resume_if_ended();
                     }
                     Err(e) => self.status = format!("Radio failed: {e}"),
                 }
@@ -1260,11 +1641,16 @@ impl App {
                     self.lyrics = l;
                 }
             }
-            Msg::Library(l) => {
+            Msg::Library(Ok(l)) => {
                 self.lib_scanning = false;
                 self.status = format!("Library: {} tracks", l.len());
-                self.library = l;
-                nav(&mut self.lib_sel, self.library.len(), 0);
+                self.set_library(l);
+                nav(&mut self.lib_sel, self.lib_vis.len(), 0);
+            }
+            // The folder went away or became unreadable since check_dir.
+            Msg::Library(Err(e)) => {
+                self.lib_scanning = false;
+                self.status = e;
             }
             Msg::Status(s) => {
                 if !s.is_empty() {
@@ -1346,7 +1732,9 @@ impl App {
                     self.status = format!("Last.fm connected as {name}");
                     self.cfg.lastfm_user = name;
                     self.lfm_token = None;
+                    self.lfm_bad_session = false;
                     self.cfg.save();
+                    self.flush_scrobbles();
                 }
                 Err(e) => self.status = e,
             },
@@ -1359,13 +1747,22 @@ impl App {
                 "time-pos" => {
                     let p = v.as_f64().unwrap_or(0.0);
                     let d = p - self.last_pos;
-                    if !self.paused && d > 0.0 && d < 2.0 {
+                    // After eof the next file's position may arrive first; don't count it.
+                    if !self.paused && !self.ended && d > 0.0 && d < 2.0 {
                         self.played += d;
+                        if self.played > 1.0 {
+                            self.fail_streak = 0;
+                        }
                     }
                     self.last_pos = p;
                     self.pos = p;
                 }
-                "duration" => self.dur = v.as_f64().unwrap_or(0.0),
+                "duration" => {
+                    self.dur = v.as_f64().unwrap_or(0.0);
+                    if self.dur > 0.0 && !self.ended {
+                        self.track_len = self.dur;
+                    }
+                }
                 "pause" => self.paused = v.as_bool().unwrap_or(false),
                 "volume" => self.volume = v.as_f64().unwrap_or(self.volume),
                 "idle-active" => self.idle = v.as_bool().unwrap_or(false),
@@ -1381,32 +1778,64 @@ impl App {
                     if self.queue.get(c).is_some_and(|t| t.url() == p) {
                         return;
                     }
-                    // mpv moved on to the prefetched next entry (gapless advance).
+                    // mpv moved on to the prefetched next entry (gapless advance)
+                    // before its eof for the old file came in.
                     if let Some(n) = self.next_playable(c + 1).filter(|&n| self.queue[n].url() == p) {
-                        self.finish_track();
-                        self.note_skipped(n - c - 1);
-                        self.cur = Some(n);
-                        self.queue_sel.select(self.cur);
-                        self.mpv_cmd(json!(["playlist-remove", 0]));
-                        self.mpv_next = None;
-                        self.on_track_start();
-                        self.sync_next();
+                        self.advance_to(n);
+                        self.skip_eof = true;
                     }
                 }
                 _ => {}
             },
             MpvEvent::EndFile(reason) => match reason.as_str() {
-                "error" => {
-                    let what = self.current().map(|t| t.title.clone()).unwrap_or_default();
-                    self.status = format!("Could not play \"{what}\" (is yt-dlp installed and up to date?)");
+                "error" => self.on_load_error(),
+                "eof" if std::mem::take(&mut self.skip_eof) => {}
+                "eof" => {
+                    self.ended = true;
+                    // With a prefetched entry mpv goes straight on to it. Done
+                    // here rather than on `path`, which doesn't change when the
+                    // same song is queued twice in a row.
+                    let next = self.mpv_next.as_ref().and(self.cur).and_then(|c| self.next_playable(c + 1));
+                    match next {
+                        Some(n) => self.advance_to(n),
+                        None => {
+                            self.finish_track();
+                            self.at_end = true;
+                        }
+                    }
                 }
-                "eof" if self.mpv_next.is_none() => self.finish_track(),
                 _ => {}
             },
             MpvEvent::Exited => {
                 self.mpv = None;
                 self.idle = true;
-                self.status = "mpv exited — restart LastWave TUI".into();
+                self.mpv_error = Some("mpv exited — restart LastWave TUI".into());
+            }
+        }
+    }
+
+    /// The playing song failed to load: skip to the next one, up to a point.
+    fn on_load_error(&mut self) {
+        let Some(c) = self.cur else { return };
+        let what = self.current().map(|t| t.title.clone()).unwrap_or_default();
+        self.playing = None;
+        self.fail_streak += 1;
+        if self.fail_streak >= MAX_FAILS {
+            self.fail_streak = 0;
+            self.mpv_cmd(json!(["stop"]));
+            self.mpv_next = None;
+            self.at_end = false;
+            self.status = format!("Stopped: {MAX_FAILS} songs in a row could not play (is yt-dlp installed and up to date?)");
+            return;
+        }
+        match self.next_playable(c + 1) {
+            Some(n) => {
+                self.play_index(n);
+                self.status = format!("Could not play \"{what}\" — skipped");
+            }
+            None => {
+                self.at_end = true;
+                self.status = format!("Could not play \"{what}\" (is yt-dlp installed and up to date?)");
             }
         }
     }
@@ -1414,6 +1843,16 @@ impl App {
     // ---- keys -------------------------------------------------------------------
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        let armed = self.confirm_signout;
+        self.handle_key(k);
+        // A key that didn't reach the Settings list also cancels a pending sign-out.
+        if armed.is_some() && self.confirm_signout == armed {
+            self.confirm_signout = None;
+        }
+        self.keep_sticky();
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) {
         if let Some(target) = self.input {
             self.on_input(target, k);
             return;
@@ -1465,6 +1904,7 @@ impl App {
             KeyCode::Char('l') if !matches!(self.view, View::Eq | View::Settings) => self.toggle_like(),
             KeyCode::Char('P') => self.open_picker(),
             KeyCode::Char('w') => self.radio_from_current(),
+            KeyCode::Char('u') => self.undo_queue(),
             code => match self.view {
                 View::Search => self.key_search(code),
                 View::Queue => self.key_queue(code),
@@ -1510,7 +1950,7 @@ impl App {
                         self.run_search();
                     }
                     Input::LibFilter => {
-                        self.lib_filter = v;
+                        self.set_lib_filter(v);
                         self.lib_sel.select(Some(0));
                     }
                     Input::LibDir => {
@@ -1534,14 +1974,14 @@ impl App {
             KeyCode::Backspace => {
                 self.input_buf.pop();
                 if target == Input::LibFilter {
-                    self.lib_filter = self.input_buf.clone();
+                    self.set_lib_filter(self.input_buf.clone());
                 }
             }
             KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => self.input_buf.clear(),
             KeyCode::Char(c) => {
                 self.input_buf.push(c);
                 if target == Input::LibFilter {
-                    self.lib_filter = self.input_buf.clone();
+                    self.set_lib_filter(self.input_buf.clone());
                     self.lib_sel.select(Some(0));
                 }
             }
@@ -1656,6 +2096,7 @@ impl App {
             }
             KeyCode::Char('c') => self.queue_sel.select(self.cur),
             KeyCode::Char('X') => {
+                self.snapshot_queue();
                 match self.cur.and_then(|c| self.queue.get(c).cloned()) {
                     Some(t) => {
                         self.queue = vec![t];
@@ -1665,7 +2106,7 @@ impl App {
                 }
                 self.queue_sel.select(self.cur);
                 self.sync_next();
-                self.status = "Queue cleared".into();
+                self.status = "Queue cleared — u to undo".into();
             }
             code => {
                 list_nav(&mut self.queue_sel, self.queue.len(), code);
@@ -1691,35 +2132,36 @@ impl App {
             self.key_library_yt(code);
             return;
         }
-        let vis = self.lib_visible();
-        let sel = self.lib_sel.selected().filter(|&i| i < vis.len());
+        let n = self.lib_vis.len();
+        let sel = self.lib_sel.selected().filter(|&i| i < n);
+        let vis_tracks = |a: &Self| a.lib_vis.iter().map(|&j| a.library[j].clone()).collect::<Vec<_>>();
         match code {
             KeyCode::Char('f') | KeyCode::Char('i') => self.begin_input(Input::LibFilter, self.lib_filter.clone()),
-            KeyCode::Esc => self.lib_filter.clear(),
+            KeyCode::Esc => self.set_lib_filter(String::new()),
             KeyCode::Char('o') => self.begin_input(Input::LibDir, self.cfg.library_dir.clone()),
             KeyCode::Char('S') => self.rescan(),
             KeyCode::Enter => {
                 if let Some(i) = sel {
-                    let tracks = vis.iter().map(|&j| self.library[j].clone()).collect();
+                    let tracks = vis_tracks(self);
                     self.play_list(tracks, i);
                 }
             }
             KeyCode::Char('a') => {
                 if let Some(i) = sel {
-                    self.append(vec![self.library[vis[i]].clone()]);
+                    self.append(vec![self.library[self.lib_vis[i]].clone()]);
                 }
             }
             KeyCode::Char('N') => {
                 if let Some(i) = sel {
-                    self.play_next(vec![self.library[vis[i]].clone()]);
+                    self.play_next(vec![self.library[self.lib_vis[i]].clone()]);
                 }
             }
             KeyCode::Char('A') => {
-                let tracks = vis.iter().map(|&j| self.library[j].clone()).collect();
+                let tracks = vis_tracks(self);
                 self.append(tracks);
             }
             code => {
-                list_nav(&mut self.lib_sel, vis.len(), code);
+                list_nav(&mut self.lib_sel, n, code);
             }
         }
     }
@@ -1837,7 +2279,7 @@ impl App {
             8 => mask(&self.cfg.lastfm_api_secret),
             10 => {
                 if ytm::signed_in() {
-                    format!("signed in as {} (Enter to sign out)", self.cfg.yt_user)
+                    format!("signed in as {} (Enter twice to sign out)", self.cfg.yt_user)
                 } else {
                     "not signed in (copy cookies, then Enter twice)".into()
                 }
@@ -1861,7 +2303,7 @@ impl App {
             14 => format!("{} (Quick picks and other Discover shelves)", on(self.cfg.hide_ai)),
             9 => {
                 if !self.cfg.lastfm_user.is_empty() && self.lfm_ready() {
-                    format!("connected as {} (Enter to disconnect)", self.cfg.lastfm_user)
+                    format!("connected as {} (Enter twice to disconnect)", self.cfg.lastfm_user)
                 } else if self.lfm_token.is_some() {
                     "waiting for browser approval — press Enter".into()
                 } else {
@@ -1874,13 +2316,43 @@ impl App {
 
     fn key_settings(&mut self, code: KeyCode) {
         let back = matches!(code, KeyCode::Left | KeyCode::Char('h'));
+        // Any other key cancels a sign-out waiting for its second Enter.
+        let armed = self.confirm_signout.take();
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.set_sel = self.set_sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS.len() - 1),
+            // Account rows: only Enter signs out, and only when pressed twice.
+            KeyCode::Enter if self.signed_in_row(self.set_sel) => {
+                let row = self.set_sel;
+                if armed == Some(row) {
+                    if row == SET_YT_ACCOUNT {
+                        self.yt_sign_out();
+                    } else {
+                        self.lfm_disconnect();
+                    }
+                } else {
+                    self.confirm_signout = Some(row);
+                    let what = if row == SET_YT_ACCOUNT { "sign out of YouTube Music" } else { "disconnect Last.fm" };
+                    self.status = format!("Press Enter again to {what} (any other key cancels)");
+                }
+            }
+            KeyCode::Right | KeyCode::Left | KeyCode::Char('l') | KeyCode::Char('h') if self.signed_in_row(self.set_sel) => {}
             KeyCode::Enter | KeyCode::Right | KeyCode::Left | KeyCode::Char('l') | KeyCode::Char('h') => {
                 self.change_setting(back)
             }
             _ => {}
+        }
+        if armed.is_some() && self.confirm_signout.is_none() && self.status.starts_with("Press Enter again") {
+            self.status = "Sign-out cancelled".into();
+        }
+    }
+
+    /// An account row (Last.fm / YouTube Music) that is currently signed in.
+    fn signed_in_row(&self, row: usize) -> bool {
+        match row {
+            SET_LFM_ACCOUNT => self.lfm_ready(),
+            SET_YT_ACCOUNT => ytm::signed_in(),
+            _ => false,
         }
     }
 
@@ -1927,14 +2399,9 @@ impl App {
             6 => self.begin_input(Input::LibDir, self.cfg.library_dir.clone()),
             7 => self.begin_input(Input::LfmKey, self.cfg.lastfm_api_key.clone()),
             8 => self.begin_input(Input::LfmSecret, self.cfg.lastfm_api_secret.clone()),
-            9 => self.lastfm_step(),
-            10 => {
-                if ytm::signed_in() {
-                    self.yt_sign_out();
-                } else {
-                    self.start_yt_login();
-                }
-            }
+            // Signed-in account rows are handled (with confirmation) in key_settings.
+            SET_LFM_ACCOUNT if !self.lfm_ready() => self.lastfm_step(),
+            SET_YT_ACCOUNT if !ytm::signed_in() => self.start_yt_login(),
             11 => {
                 self.cfg.yt_account_playback = !self.cfg.yt_account_playback;
                 self.cfg.save();
@@ -1978,14 +2445,15 @@ impl App {
         }
     }
 
+    fn lfm_disconnect(&mut self) {
+        self.cfg.lastfm_session.clear();
+        self.cfg.lastfm_user.clear();
+        self.cfg.save();
+        self.lfm_bad_session = false;
+        self.status = "Last.fm disconnected".into();
+    }
+
     fn lastfm_step(&mut self) {
-        if self.lfm_ready() {
-            self.cfg.lastfm_session.clear();
-            self.cfg.lastfm_user.clear();
-            self.cfg.save();
-            self.status = "Last.fm disconnected".into();
-            return;
-        }
         if self.cfg.lastfm_api_key.is_empty() || self.cfg.lastfm_api_secret.is_empty() {
             self.status = "Enter a Last.fm API key + secret first (last.fm/api/account/create)".into();
             return;
@@ -2111,5 +2579,83 @@ fn mask(s: &str) -> String {
         "(not set)".into()
     } else {
         format!("{}…", s.chars().take(6).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Source;
+
+    fn t(id: &str) -> Track {
+        Track {
+            source: Source::Yt(id.into()),
+            title: id.into(),
+            artist: String::new(),
+            album: String::new(),
+            duration: 0,
+            quality: String::new(),
+            art: String::new(),
+        }
+    }
+
+    fn ids(q: &[Track]) -> Vec<String> {
+        q.iter().map(|t| t.title.clone()).collect()
+    }
+
+    #[test]
+    fn scrobble_rule() {
+        assert!(!scrobble_eligible(25.0, 25.0, true), "too short");
+        assert!(scrobble_eligible(200.0, 100.0, false), "half played");
+        assert!(!scrobble_eligible(200.0, 90.0, false));
+        assert!(scrobble_eligible(1200.0, 240.0, false), "4 minutes of a long track");
+        // Length unknown: a song that played to its end counts as its play time.
+        assert!(scrobble_eligible(0.0, 180.0, true));
+        assert!(!scrobble_eligible(0.0, 20.0, true));
+        assert!(!scrobble_eligible(0.0, 180.0, false));
+        assert!(scrobble_eligible(0.0, 240.0, false));
+    }
+
+    #[test]
+    fn library_filter_is_cached_and_follows_changes() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        let mut a = t("Blue Monday");
+        a.artist = "New Order".into();
+        let mut b = t("Atmosphere");
+        b.artist = "Joy Division".into();
+        b.album = "Substance".into();
+        let mut c = t("Ceremony");
+        c.artist = "New Order".into();
+        app.set_library(vec![a, b, c]);
+        assert_eq!(app.lib_visible(), [0, 1, 2]);
+        app.set_lib_filter("new ORDER".into());
+        assert_eq!(app.lib_visible(), [0, 2]);
+        app.set_lib_filter("order cere".into());
+        assert_eq!(app.lib_visible(), [2]);
+        app.set_lib_filter("substance".into());
+        assert_eq!(app.lib_visible(), [1]);
+        // A new scan refilters with the current filter.
+        app.set_library(vec![t("x"), t("Substance 1987")]);
+        assert_eq!(app.lib_visible(), [1]);
+        app.set_lib_filter(String::new());
+        assert_eq!(app.lib_visible(), [0, 1]);
+    }
+
+    #[test]
+    fn undo_keeps_playing_song_current() {
+        let old = vec![t("a"), t("b"), t("c")];
+        // The old current song is still playing.
+        let (q, c) = restore_queue(old.clone(), Some(1), Some(&t("b")));
+        assert_eq!((ids(&q), c), (ids(&old), Some(1)));
+        // Playing a song that was elsewhere in the old queue.
+        let (q, c) = restore_queue(old.clone(), Some(0), Some(&t("c")));
+        assert_eq!((ids(&q), c), (ids(&old), Some(2)));
+        // A song from the replacing list keeps playing, slotted after the old current.
+        let (q, c) = restore_queue(old.clone(), Some(1), Some(&t("x")));
+        assert_eq!((ids(&q), c), (vec!["a".into(), "b".into(), "x".into(), "c".into()], Some(2)));
+        // Nothing playing.
+        let (q, c) = restore_queue(old.clone(), Some(1), None);
+        assert_eq!((ids(&q), c), (ids(&old), None));
     }
 }
