@@ -1,11 +1,12 @@
 use crate::{
+    aifilter,
     art::{self, Covers},
     config::{self, Config, State, REPLAYGAIN, YTDL_FORMATS},
     eq, lastfm, library,
     lyrics::{self, Lyrics},
     model::Track,
     mpv::{Mpv, MpvEvent},
-    ytm::{self, Collection, Entry, Kind, Results, Shelf},
+    ytm::{self, AddTarget, Collection, Entry, Kind, Results, Shelf},
 };
 use image::DynamicImage;
 use ratatui::{
@@ -64,6 +65,13 @@ pub enum Msg {
     LfmToken(Result<String, String>),
     LfmSession(Result<(String, String), String>),
     Art(String, Option<DynamicImage>),
+    AiList(Result<usize, String>),
+    Liked(Result<HashSet<String>, String>),
+    /// (video id, liked, result)
+    LikeResult(String, bool, Result<(), String>),
+    AddTargets(String, Result<Vec<AddTarget>, String>),
+    /// (playlist title, browse id of the playlist added to)
+    Added(String, Result<String, String>),
 }
 
 /// One row of the Discover list.
@@ -83,6 +91,8 @@ struct Cache {
     yt_lists: Vec<Collection>,
     /// Tracks of library playlists that were opened, by browse id.
     pages: std::collections::HashMap<String, Vec<Track>>,
+    #[serde(default)]
+    liked: HashSet<String>,
 }
 
 const CACHE_FILE: &str = "cache.json";
@@ -92,6 +102,14 @@ const MAX_CACHED_PAGES: usize = 24;
 pub enum LibMode {
     Local,
     Yt,
+}
+
+/// "Add to playlist" popup for one song. Row 0 is "+ New playlist…".
+pub struct Picker {
+    pub track: Track,
+    pub items: Vec<AddTarget>,
+    pub sel: ListState,
+    pub loading: bool,
 }
 
 /// What the details drawer shows.
@@ -132,6 +150,7 @@ pub enum Input {
     LfmKey,
     LfmSecret,
     YtCookies,
+    NewPlaylist,
 }
 
 pub const SETTINGS: &[&str] = &[
@@ -148,6 +167,8 @@ pub const SETTINGS: &[&str] = &[
     "YouTube Music account",
     "Use account for playback",
     "Cover images",
+    "Skip AI songs",
+    "Hide AI songs in Discover",
 ];
 
 const SET_YT_ACCOUNT: usize = 10;
@@ -192,6 +213,9 @@ pub struct App {
     pub yt_open_sel: ListState,
     pub yt_loading: bool,
     cache: Cache,
+    /// Video ids in the account's Liked Music.
+    pub liked: HashSet<String>,
+    pub picker: Option<Picker>,
 
     pub pos: f64,
     pub dur: f64,
@@ -298,6 +322,8 @@ impl App {
             yt_open_sel: ListState::default(),
             yt_loading: false,
             cache: Cache::default(),
+            liked: HashSet::new(),
+            picker: None,
             pos: 0.0,
             dur: 0.0,
             paused: false,
@@ -348,6 +374,14 @@ impl App {
             Err(e) => self.status = e,
         }
         self.rescan();
+        // Loaded even with skipping off: the [AI] marks use it too.
+        if aifilter::load_cached() {
+            self.spawn(|| Msg::AiList(aifilter::refresh()));
+        }
+        if let Some(c) = self.cur.filter(|&c| self.cfg.skip_ai && self.is_ai(&self.queue[c])) {
+            self.cur = self.next_playable(c);
+            self.queue_sel.select(self.cur);
+        }
         if let Some(c) = config::load_cookies() {
             ytm::set_auth(Some(c));
         }
@@ -358,15 +392,18 @@ impl App {
         if cache.user == who {
             self.discover = cache.discover.clone();
             self.discover_sel.select((self.discover.len() > 1).then_some(1));
+            self.hide_ai_discover();
             if ytm::signed_in() {
                 self.yt_lists = cache.yt_lists.clone();
                 self.yt_lists_sel.select((!self.yt_lists.is_empty()).then_some(0));
+                self.liked = cache.liked.clone();
             }
             self.cache = cache;
         } else {
             self.cache.user = who;
         }
         self.load_yt_lists();
+        self.load_liked();
         self.load_home();
     }
 
@@ -374,6 +411,7 @@ impl App {
         self.cache.user = if ytm::signed_in() { self.cfg.yt_user.clone() } else { String::new() };
         self.cache.discover = self.discover.clone();
         self.cache.yt_lists = self.yt_lists.clone();
+        self.cache.liked = self.liked.clone();
         config::save(CACHE_FILE, &self.cache);
     }
 
@@ -392,6 +430,108 @@ impl App {
         }
         self.yt_loading = true;
         self.spawn(|| Msg::YtLists(ytm::library_playlists()));
+    }
+
+    fn load_liked(&mut self) {
+        if ytm::signed_in() {
+            self.spawn(|| Msg::Liked(ytm::liked_ids()));
+        }
+    }
+
+    pub fn is_liked(&self, t: &Track) -> bool {
+        t.video_id().is_some_and(|id| self.liked.contains(id))
+    }
+
+    /// The highlighted song, else the playing one.
+    fn action_track(&self) -> Option<Track> {
+        match self.highlighted() {
+            Some(Highlight::Track(t)) => Some(t),
+            _ => self.current().cloned(),
+        }
+    }
+
+    /// The song an account action applies to and its video id, or why there is none.
+    fn account_target(&mut self, what: &str) -> Option<(Track, String)> {
+        if !ytm::signed_in() {
+            self.status = format!("Sign in to YouTube Music (Library → y) to {what}");
+            return None;
+        }
+        let t = self.action_track()?;
+        match t.video_id().map(str::to_string) {
+            Some(id) => Some((t, id)),
+            None => {
+                self.status = "Local files aren't on YouTube Music".into();
+                None
+            }
+        }
+    }
+
+    fn toggle_like(&mut self) {
+        let Some((t, id)) = self.account_target("like songs") else { return };
+        let liked = !self.liked.contains(&id);
+        if liked {
+            self.liked.insert(id.clone());
+        } else {
+            self.liked.remove(&id);
+        }
+        self.status = format!("{} {}", if liked { "♥ Liked" } else { "Removed like:" }, t.title);
+        self.spawn(move || {
+            let r = ytm::set_liked(&id, liked);
+            Msg::LikeResult(id, liked, r)
+        });
+    }
+
+    fn open_picker(&mut self) {
+        let Some((t, id)) = self.account_target("add to playlists") else { return };
+        let mut sel = ListState::default();
+        sel.select(Some(0));
+        self.picker = Some(Picker { track: t, items: Vec::new(), sel, loading: true });
+        self.spawn(move || {
+            let r = ytm::add_targets(&id);
+            Msg::AddTargets(id, r)
+        });
+    }
+
+    fn key_picker(&mut self, code: KeyCode) {
+        let Some(p) = &mut self.picker else { return };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('P') => self.picker = None,
+            KeyCode::Enter => match p.sel.selected() {
+                Some(0) => self.begin_input(Input::NewPlaylist, String::new()),
+                Some(i) => {
+                    let Some(target) = p.items.get(i - 1).cloned() else { return };
+                    if target.has {
+                        self.status = format!("Already in {}", target.title);
+                        return;
+                    }
+                    let id = p.track.video_id().unwrap_or_default().to_string();
+                    self.picker = None;
+                    self.status = format!("Adding to {}…", target.title);
+                    self.spawn(move || {
+                        let r = ytm::add_to_playlist(&target.playlist_id, &id).map(|_| browse_id_of(&target.playlist_id));
+                        Msg::Added(target.title, r)
+                    });
+                }
+                None => {}
+            },
+            code => {
+                let len = p.items.len() + 1;
+                list_nav(&mut p.sel, len, code);
+            }
+        }
+    }
+
+    fn create_playlist(&mut self, title: String) {
+        let Some(p) = self.picker.take() else { return };
+        if title.is_empty() {
+            return;
+        }
+        let id = p.track.video_id().unwrap_or_default().to_string();
+        self.status = format!("Creating {title}…");
+        self.spawn(move || {
+            let r = ytm::create_playlist(&title, &id).map(|pid| browse_id_of(&pid));
+            Msg::Added(title, r)
+        });
     }
 
     fn open_collection(&mut self, c: Collection, lib: bool) {
@@ -442,6 +582,8 @@ impl App {
         self.cfg.save();
         self.yt_lists.clear();
         self.yt_open = None;
+        self.liked.clear();
+        self.picker = None;
         self.cache = Cache::default();
         config::save(CACHE_FILE, &self.cache);
         self.mpv_set("ytdl-raw-options", "");
@@ -502,6 +644,48 @@ impl App {
         self.cur.and_then(|i| self.queue.get(i))
     }
 
+    pub fn is_ai(&self, t: &Track) -> bool {
+        aifilter::is_ai(t, &self.cfg.ai_flagged, &self.cfg.ai_allowed)
+    }
+
+    /// Albums by an AI artist ("Album • Artist • 2024") and AI artist pages.
+    /// Playlists are left alone: their subtitle names the curator.
+    pub fn is_ai_coll(&self, c: &Collection) -> bool {
+        let ai = |n: &str| aifilter::is_ai_artist(n, &self.cfg.ai_flagged, &self.cfg.ai_allowed);
+        match c.browse_id.get(..2) {
+            Some("UC") => ai(&c.title),
+            Some("MP") => c.subtitle.split(" • ").map(str::trim).any(|p| {
+                !p.is_empty() && !ytm::TYPE_WORDS.contains(&p) && !p.bytes().all(|b| b.is_ascii_digit()) && ai(p)
+            }),
+            _ => false,
+        }
+    }
+
+    /// First queue index from `from` on that should play: with "Skip AI
+    /// songs" on, tracks by AI artists are passed over.
+    fn next_playable(&self, from: usize) -> Option<usize> {
+        (from..self.queue.len()).find(|&i| !self.cfg.skip_ai || !self.is_ai(&self.queue[i]))
+    }
+
+    /// Last queue index before `before` that should play.
+    fn prev_playable(&self, before: usize) -> Option<usize> {
+        (0..before).rev().find(|&i| !self.cfg.skip_ai || !self.is_ai(&self.queue[i]))
+    }
+
+    /// With "Skip AI songs" on, drop AI tracks; returns (kept, dropped count).
+    fn drop_ai(&self, tracks: Vec<Track>) -> (Vec<Track>, usize) {
+        let n = tracks.len();
+        let kept: Vec<Track> = tracks.into_iter().filter(|t| !self.cfg.skip_ai || !self.is_ai(t)).collect();
+        let ai = n - kept.len();
+        (kept, ai)
+    }
+
+    fn note_skipped(&mut self, n: usize) {
+        if n > 0 {
+            self.status = format!("Skipped {n} AI-generated song{}", if n == 1 { "" } else { "s" });
+        }
+    }
+
     fn play_index(&mut self, i: usize) {
         let Some(url) = self.queue.get(i).map(Track::url) else { return };
         self.finish_track();
@@ -517,7 +701,7 @@ impl App {
     /// Keep mpv's playlist as [current, next] so gapless + prefetch work.
     fn sync_next(&mut self) {
         let Some(c) = self.cur else { return };
-        let want = self.queue.get(c + 1).map(Track::url);
+        let want = self.next_playable(c + 1).map(|i| self.queue[i].url());
         if want == self.mpv_next {
             return;
         }
@@ -622,18 +806,20 @@ impl App {
 
     /// Insert right after the current track (or at the end when idle).
     pub fn play_next(&mut self, tracks: Vec<Track>) {
+        let (tracks, ai) = self.drop_ai(tracks);
         let n = tracks.len();
         let at = self.cur.map_or(self.queue.len(), |c| c + 1);
         self.queue.splice(at..at, tracks);
         self.sync_next();
-        self.status = format!("{n} track{} will play next", if n == 1 { "" } else { "s" });
+        self.status = format!("{n} track{} will play next{}", if n == 1 { "" } else { "s" }, ai_left_out(ai));
     }
 
     pub fn append(&mut self, tracks: Vec<Track>) {
+        let (tracks, ai) = self.drop_ai(tracks);
         let n = tracks.len();
         self.queue.extend(tracks);
         self.sync_next();
-        self.status = format!("Added {n} track{} to queue", if n == 1 { "" } else { "s" });
+        self.status = format!("Added {n} track{} to queue{}", if n == 1 { "" } else { "s" }, ai_left_out(ai));
     }
 
     fn start_radio(&mut self, t: Track) {
@@ -646,25 +832,133 @@ impl App {
         }
     }
 
+    /// Radio from the playing song without restarting it: what's queued
+    /// after it is replaced by the radio.
+    fn radio_from_current(&mut self) {
+        let Some(c) = self.cur else {
+            self.status = "Nothing is playing".into();
+            return;
+        };
+        let Some(id) = self.queue[c].video_id().map(str::to_string) else {
+            self.status = "Radio needs a YouTube song".into();
+            return;
+        };
+        self.queue.truncate(c + 1);
+        self.sync_next();
+        self.radio_busy = true;
+        self.status = "Starting radio…".into();
+        self.spawn(move || Msg::Radio(ytm::radio(&id)));
+    }
+
     fn next(&mut self) {
-        match self.cur {
-            Some(c) if c + 1 < self.queue.len() => self.play_index(c + 1),
-            _ => self.status = "End of queue".into(),
+        let from = self.cur.map_or(0, |c| c + 1);
+        match self.next_playable(from) {
+            Some(i) => {
+                self.play_index(i);
+                self.note_skipped(i - from);
+            }
+            None => self.status = "End of queue".into(),
         }
     }
 
+    /// Flag (or unflag) the playing song's artist as AI-generated.
+    /// Drop AI tracks (and shelves left empty) from Discover when hiding is on.
+    fn hide_ai_discover(&mut self) {
+        if !self.cfg.hide_ai {
+            return;
+        }
+        let sel = self.discover_sel.selected().and_then(|i| self.discover.get(i)).map(|d| match d {
+            DItem::Track(t) => t.url(),
+            DItem::Coll(c) => c.browse_id.clone(),
+            DItem::Header(h) => h.clone(),
+        });
+        let items = std::mem::take(&mut self.discover);
+        for d in items {
+            if matches!(&d, DItem::Track(t) if self.is_ai(t)) || matches!(&d, DItem::Coll(c) if self.is_ai_coll(c)) {
+                continue;
+            }
+            if matches!(d, DItem::Header(_)) && matches!(self.discover.last(), Some(DItem::Header(_))) {
+                self.discover.pop();
+            }
+            self.discover.push(d);
+        }
+        if matches!(self.discover.last(), Some(DItem::Header(_))) {
+            self.discover.pop();
+        }
+        let i = sel.and_then(|k| {
+            self.discover.iter().position(|d| match d {
+                DItem::Track(t) => t.url() == k,
+                DItem::Coll(c) => c.browse_id == k,
+                DItem::Header(h) => *h == k,
+            })
+        });
+        self.discover_sel.select(i.or((self.discover.len() > 1).then_some(1)));
+    }
+
+    fn toggle_ai_flag(&mut self) {
+        let Some(t) = self.current().cloned() else { return };
+        if self.is_ai(&t) {
+            aifilter::unflag(&t.artist, &mut self.cfg.ai_flagged, &mut self.cfg.ai_allowed, aifilter::listed);
+            self.cfg.save();
+            self.status = format!("{} is no longer treated as AI", t.artist);
+            self.sync_next();
+            return;
+        }
+        let name = aifilter::flag(&t.artist, &mut self.cfg.ai_flagged, &mut self.cfg.ai_allowed, aifilter::listed);
+        self.cfg.save();
+        self.hide_ai_discover();
+        if !self.cfg.skip_ai {
+            self.status = format!("Flagged {name} — turn on Skip AI songs in Settings to skip them");
+            return;
+        }
+        let removed = self.drop_ai_from_queue();
+        self.next();
+        if self.status != "End of queue" {
+            self.status = format!("Flagged {name} as AI-generated");
+        }
+        if removed > 0 {
+            self.status += &format!("; removed {removed} more AI song{} from the queue", if removed == 1 { "" } else { "s" });
+        }
+    }
+
+    /// Remove AI tracks from the queue, except the current one.
+    fn drop_ai_from_queue(&mut self) -> usize {
+        let before = self.queue.len();
+        let cur = self.cur;
+        let keep: Vec<bool> = self.queue.iter().enumerate().map(|(i, t)| Some(i) == cur || !self.is_ai(t)).collect();
+        let mut new_cur = None;
+        let mut q = Vec::with_capacity(before);
+        for (i, t) in std::mem::take(&mut self.queue).into_iter().enumerate() {
+            if keep[i] {
+                if Some(i) == cur {
+                    new_cur = Some(q.len());
+                }
+                q.push(t);
+            }
+        }
+        self.queue = q;
+        self.cur = new_cur;
+        nav(&mut self.queue_sel, self.queue.len(), 0);
+        before - self.queue.len()
+    }
+
     fn prev(&mut self) {
-        match self.cur {
-            _ if self.pos > 3.0 => self.mpv_cmd(json!(["seek", 0, "absolute"])),
-            Some(c) if c > 0 => self.play_index(c - 1),
+        match self.cur.and_then(|c| self.prev_playable(c)) {
+            Some(i) if self.pos <= 3.0 => self.play_index(i),
             _ => self.mpv_cmd(json!(["seek", 0, "absolute"])),
         }
     }
 
     fn toggle_pause(&mut self) {
         if self.idle {
-            if let Some(c) = self.cur.or(if self.queue.is_empty() { None } else { Some(0) }) {
-                self.play_index(c);
+            let from = self.cur.unwrap_or(0);
+            match self.next_playable(from) {
+                Some(i) => {
+                    self.play_index(i);
+                    self.note_skipped(i - from);
+                }
+                None if !self.queue.is_empty() => self.status = "Nothing left to play (the rest is AI-generated)".into(),
+                None => {}
             }
         } else {
             self.mpv_cmd(json!(["cycle", "pause"]));
@@ -683,11 +977,15 @@ impl App {
         }
         if was_current {
             self.finish_track();
-            if i < self.queue.len() {
-                self.play_index(i);
-            } else {
-                self.cur = None;
-                self.mpv_cmd(json!(["stop"]));
+            match self.next_playable(i) {
+                Some(n) => {
+                    self.play_index(n);
+                    self.note_skipped(n - i);
+                }
+                None => {
+                    self.cur = None;
+                    self.mpv_cmd(json!(["stop"]));
+                }
             }
         } else {
             self.sync_next();
@@ -903,6 +1201,7 @@ impl App {
                                 Entry::Collection(c) => DItem::Coll(c),
                             }));
                         }
+                        self.hide_ai_discover();
                         let keep = self.discover_sel.selected().filter(|&i| matches!(self.discover.get(i), Some(DItem::Track(_) | DItem::Coll(_))));
                         self.discover_sel.select(keep.or((self.discover.len() > 1).then_some(1)));
                         self.save_cache();
@@ -919,6 +1218,7 @@ impl App {
                     self.mpv_set("ytdl-raw-options", config::ytdl_raw_options(&self.cfg));
                     self.load_home();
                     self.load_yt_lists();
+                    self.load_liked();
                 }
                 Err(e) => self.status = e,
             },
@@ -941,10 +1241,15 @@ impl App {
                     Ok(tracks) => {
                         let have: HashSet<String> = self.queue.iter().map(Track::url).collect();
                         let fresh: Vec<Track> = tracks.into_iter().filter(|t| !have.contains(&t.url())).collect();
+                        let total = fresh.len();
+                        let fresh: Vec<Track> = fresh.into_iter().filter(|t| !self.cfg.skip_ai || !self.is_ai(t)).collect();
                         let n = fresh.len();
                         self.queue.extend(fresh);
                         self.sync_next();
-                        self.status = format!("Radio: +{n} tracks");
+                        self.status = match total - n {
+                            0 => format!("Radio: +{n} tracks"),
+                            ai => format!("Radio: +{n} tracks ({ai} AI-generated left out)"),
+                        };
                     }
                     Err(e) => self.status = format!("Radio failed: {e}"),
                 }
@@ -979,6 +1284,62 @@ impl App {
                     c.loaded(key, img);
                 }
             }
+            Msg::AiList(r) => match r {
+                Ok(n) => {
+                    if self.view == View::Settings {
+                        self.status = format!("AI artist list updated: {n} artists");
+                    }
+                    self.hide_ai_discover();
+                    self.sync_next();
+                }
+                Err(e) => self.status = e,
+            },
+            Msg::Liked(r) => {
+                if let Ok(l) = r {
+                    self.liked = l;
+                    self.save_cache();
+                }
+            }
+            Msg::LikeResult(id, liked, r) => match r {
+                // Liked Music changed: refetch it next time it's opened.
+                Ok(()) => {
+                    self.cache.pages.remove("VLLM");
+                    self.save_cache();
+                }
+                Err(e) => {
+                    if liked {
+                        self.liked.remove(&id);
+                    } else {
+                        self.liked.insert(id);
+                    }
+                    self.status = format!("Could not update like: {e}");
+                }
+            },
+            Msg::AddTargets(id, r) => {
+                let Some(p) = self.picker.as_mut().filter(|p| p.track.video_id() == Some(id.as_str())) else { return };
+                match r {
+                    Ok(items) => {
+                        p.items = items;
+                        p.loading = false;
+                    }
+                    Err(e) => {
+                        self.picker = None;
+                        self.status = format!("Could not load playlists: {e}");
+                    }
+                }
+            }
+            Msg::Added(title, r) => match r {
+                Ok(bid) => {
+                    self.status = format!("Added to {title}");
+                    self.cache.pages.remove(&bid);
+                    if let Some(c) = self.yt_open.as_ref().map(|(c, _)| c.clone()).filter(|c| c.browse_id == bid) {
+                        self.open_collection(c, true);
+                    }
+                    self.save_cache();
+                    self.load_yt_lists();
+                }
+                Err(e) => self.status = format!("Could not add to {title}: {e}"),
+            },
             Msg::LfmSession(r) => match r {
                 Ok((sk, name)) => {
                     self.cfg.lastfm_session = sk;
@@ -1021,9 +1382,10 @@ impl App {
                         return;
                     }
                     // mpv moved on to the prefetched next entry (gapless advance).
-                    if self.queue.get(c + 1).is_some_and(|t| t.url() == p) {
+                    if let Some(n) = self.next_playable(c + 1).filter(|&n| self.queue[n].url() == p) {
                         self.finish_track();
-                        self.cur = Some(c + 1);
+                        self.note_skipped(n - c - 1);
+                        self.cur = Some(n);
                         self.queue_sel.select(self.cur);
                         self.mpv_cmd(json!(["playlist-remove", 0]));
                         self.mpv_next = None;
@@ -1058,6 +1420,10 @@ impl App {
         }
         if self.help {
             self.help = false;
+            return;
+        }
+        if self.picker.is_some() {
+            self.key_picker(k.code);
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1095,6 +1461,10 @@ impl App {
                 self.cfg.save();
                 self.maybe_radio();
             }
+            KeyCode::Char('B') => self.toggle_ai_flag(),
+            KeyCode::Char('l') if !matches!(self.view, View::Eq | View::Settings) => self.toggle_like(),
+            KeyCode::Char('P') => self.open_picker(),
+            KeyCode::Char('w') => self.radio_from_current(),
             code => match self.view {
                 View::Search => self.key_search(code),
                 View::Queue => self.key_queue(code),
@@ -1158,6 +1528,7 @@ impl App {
                     }
                     // Nothing typed: read the system clipboard instead.
                     Input::YtCookies => self.submit_yt_cookies(Some(v).filter(|v| !v.is_empty())),
+                    Input::NewPlaylist => self.create_playlist(v),
                 }
             }
             KeyCode::Backspace => {
@@ -1480,6 +1851,14 @@ impl App {
                     self.cfg.image_protocol.clone()
                 }
             }
+            13 => {
+                let n = aifilter::count();
+                let listed = if n > 0 { format!("{n} known AI artists") } else { "list not downloaded yet".into() };
+                let mine = self.cfg.ai_flagged.len();
+                let mine = if mine > 0 { format!(", {mine} flagged by you") } else { String::new() };
+                format!("{} ({listed}{mine}; B flags the playing artist)", on(self.cfg.skip_ai))
+            }
+            14 => format!("{} (Quick picks and other Discover shelves)", on(self.cfg.hide_ai)),
             9 => {
                 if !self.cfg.lastfm_user.is_empty() && self.lfm_ready() {
                     format!("connected as {} (Enter to disconnect)", self.cfg.lastfm_user)
@@ -1572,6 +1951,29 @@ impl App {
                     c.set_protocol(&self.cfg.image_protocol);
                 }
             }
+            13 => {
+                self.cfg.skip_ai = !self.cfg.skip_ai;
+                self.cfg.save();
+                if self.cfg.skip_ai {
+                    self.status = "Downloading the AI artist list…".into();
+                    self.spawn(|| Msg::AiList(aifilter::refresh()));
+                }
+                self.sync_next();
+            }
+            14 => {
+                self.cfg.hide_ai = !self.cfg.hide_ai;
+                self.cfg.save();
+                if self.cfg.hide_ai {
+                    self.hide_ai_discover();
+                    self.save_cache();
+                    if aifilter::count() == 0 {
+                        self.spawn(|| Msg::AiList(aifilter::refresh()));
+                    }
+                } else {
+                    // Hidden songs are gone from the list; fetch it again.
+                    self.load_home();
+                }
+            }
             _ => {}
         }
     }
@@ -1646,8 +2048,10 @@ impl App {
         let pos = Position::new(m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.input.is_some() || self.help {
-                    self.input = None;
+                if self.input.is_some() || self.help || self.picker.is_some() {
+                    if self.input.take().is_none() {
+                        self.picker = None;
+                    }
                     self.help = false;
                     return;
                 }
@@ -1691,6 +2095,15 @@ impl App {
     pub fn config_path(&self) -> String {
         config::config_path().to_string_lossy().into_owned()
     }
+}
+
+/// "PLxxx" / "VLPLxxx" -> the browse id library pages are keyed by.
+fn browse_id_of(playlist_id: &str) -> String {
+    if playlist_id.starts_with("VL") { playlist_id.to_string() } else { format!("VL{playlist_id}") }
+}
+
+fn ai_left_out(n: usize) -> String {
+    if n == 0 { String::new() } else { format!(" ({n} AI-generated left out)") }
 }
 
 fn mask(s: &str) -> String {

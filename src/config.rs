@@ -30,6 +30,14 @@ pub struct Config {
     pub yt_account_playback: bool,
     /// Cover rendering: auto | kitty | iterm2 | sixel | halfblocks.
     pub image_protocol: String,
+    /// Skip songs by known AI-generated artists when advancing.
+    pub skip_ai: bool,
+    /// Leave AI-generated songs out of Discover (Quick picks etc.).
+    pub hide_ai: bool,
+    /// Artists the user flagged as AI (normalised names).
+    pub ai_flagged: Vec<String>,
+    /// Artists on the community list the user unflagged.
+    pub ai_allowed: Vec<String>,
 }
 
 impl Default for Config {
@@ -54,6 +62,10 @@ impl Default for Config {
             yt_user: String::new(),
             yt_account_playback: false,
             image_protocol: "auto".into(),
+            skip_ai: false,
+            hide_ai: false,
+            ai_flagged: Vec::new(),
+            ai_allowed: Vec::new(),
         }
     }
 }
@@ -81,8 +93,17 @@ pub fn config_path() -> PathBuf {
     dir().join("config.json")
 }
 
+/// A file that exists but doesn't parse is kept as `<name>.bak` so the
+/// next save doesn't silently wipe it.
 pub fn load<T: Default + for<'de> Deserialize<'de>>(name: &str) -> T {
-    fs::read_to_string(dir().join(name)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    let path = dir().join(name);
+    let Ok(s) = fs::read_to_string(&path) else { return T::default() };
+    serde_json::from_str(&s).unwrap_or_else(|e| {
+        let bak = dir().join(format!("{name}.bak"));
+        let _ = fs::rename(&path, &bak);
+        eprintln!("lastwave-tui: {} is unreadable ({e}); moved to {}", path.display(), bak.display());
+        T::default()
+    })
 }
 
 pub fn save<T: Serialize>(name: &str, v: &T) {

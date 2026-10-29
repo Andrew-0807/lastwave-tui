@@ -68,7 +68,7 @@ or Sixel graphics protocol (WezTerm, Kitty, iTerm2, Windows Terminal 1.22+); oth
 | LastWave Desktop | TUI |
 |---|---|
 | YouTube Music search (songs/albums/artists/playlists), album & playlist pages | yes: InnerTube web client, plus pasted YouTube links |
-| Radio / endless autoplay | yes: `r` starts a radio from a song, `R` toggles autoplay |
+| Radio / endless autoplay | yes: `r` starts a radio from a song, `w` from the playing song, `R` toggles autoplay |
 | Queue with gapless + prefetch | yes: mpv's playlist is kept as [current, next] |
 | Local hi-res library (FLAC/ALAC/WAV/DSD…) | yes: tags via lofty, bit depth / sample rate shown |
 | WASAPI exclusive / bit-perfect output, device selection | yes: Settings view; shows **BIT-PERFECT** when in == out |
@@ -79,12 +79,14 @@ or Sixel graphics protocol (WezTerm, Kitty, iTerm2, Windows Terminal 1.22+); oth
 | Lossless addon servers | no (needs LastWave's private client secret) |
 | Discover (YouTube Music home, personalised when signed in) | yes: shown when the search bar is empty |
 | YouTube Music sign-in, Liked Music + playlists in Library | yes: paste browser cookies (no webview) |
+| Like songs, add songs to playlists / new playlists | yes: `l` likes/unlikes, `P` opens the playlist picker (synced to your YouTube Music account) |
+| Skip AI-generated songs | yes: Settings → Skip AI songs, using the community list from [spotify-ai-blocker](https://github.com/CennoxX/spotify-ai-blocker); `B` flags/unflags the playing artist; Settings → Hide AI songs in Discover removes them from Quick picks and other shelves |
 | Discord, MPRIS/SMTC, downloads | not yet |
 
 ## Keys
 
 `?` shows the key list. Common keys: `1-6` switch views, `/` search from anywhere (an empty search shows Discover), `Enter` play,
-`a` add to queue, `Space` play/pause, `n`/`p` next/previous, `←`/`→` seek, `+`/`-` volume, `q` quit.
+`a` add to queue, `l` like, `P` add to playlist, `Space` play/pause, `n`/`p` next/previous, `←`/`→` seek, `+`/`-` volume, `q` quit.
 
 ## Files
 

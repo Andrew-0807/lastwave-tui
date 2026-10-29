@@ -268,7 +268,7 @@ fn browse_id(run: &Value) -> Option<&str> {
     run["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str()
 }
 
-const TYPE_WORDS: &[&str] = &["Song", "Video", "Episode", "Album", "Single", "EP", "Playlist", "Artist"];
+pub const TYPE_WORDS: &[&str] = &["Song", "Video", "Episode", "Album", "Single", "EP", "Playlist", "Artist"];
 
 /// Split "Artist • Album • 3:45" byline runs into (artist, album, duration).
 fn byline(runs: &[Value]) -> (String, String, u32) {
@@ -516,11 +516,21 @@ pub fn account_name() -> Result<String, String> {
 
 /// Liked Music + the account's saved/created playlists.
 pub fn library_playlists() -> Result<Vec<Collection>, String> {
-    let root = post("browse", json!({"browseId": "FEmusic_liked_playlists"}))?;
-    let mut lists: Vec<Collection> = parse_collections(&root)
-        .into_iter()
-        .filter(|c| c.browse_id.starts_with("VL") || c.browse_id.starts_with("PL"))
-        .collect();
+    let mut root = post("browse", json!({"browseId": "FEmusic_liked_playlists"}))?;
+    let mut lists = parse_collections(&root);
+    for _ in 0..MAX_PAGES {
+        root = match next_page(&root) {
+            Some(Ok(v)) => v,
+            _ => break,
+        };
+        let more = parse_collections(&root);
+        if more.is_empty() {
+            break;
+        }
+        lists.extend(more);
+    }
+    let mut seen = HashSet::new();
+    lists.retain(|c| (c.browse_id.starts_with("VL") || c.browse_id.starts_with("PL")) && seen.insert(c.browse_id.clone()));
     let liked = |c: &Collection| c.browse_id == "VLLM";
     if !lists.iter().any(liked) {
         lists.insert(0, Collection { title: "Liked Music".into(), subtitle: "Auto playlist".into(), browse_id: "VLLM".into(), art: String::new() });
@@ -529,6 +539,61 @@ pub fn library_playlists() -> Result<Vec<Collection>, String> {
         lists.insert(0, c);
     }
     Ok(lists)
+}
+
+/// Video ids in the account's Liked Music.
+pub fn liked_ids() -> Result<HashSet<String>, String> {
+    Ok(browse("VLLM")?.iter().filter_map(|t| t.video_id().map(str::to_string)).collect())
+}
+
+pub fn set_liked(video_id: &str, liked: bool) -> Result<(), String> {
+    let ep = if liked { "like/like" } else { "like/removelike" };
+    post(ep, json!({"target": {"videoId": video_id}})).map(|_| ())
+}
+
+#[derive(Clone, Debug)]
+pub struct AddTarget {
+    pub playlist_id: String,
+    pub title: String,
+    /// The video is already in it.
+    pub has: bool,
+}
+
+/// Playlists the account can add `video_id` to.
+pub fn add_targets(video_id: &str) -> Result<Vec<AddTarget>, String> {
+    Ok(parse_add_targets(&post("playlist/get_add_to_playlist", json!({"videoIds": [video_id]}))?))
+}
+
+fn parse_add_targets(root: &Value) -> Vec<AddTarget> {
+    let mut opts = Vec::new();
+    collect(root, "playlistAddToOptionRenderer", &mut opts);
+    opts.into_iter()
+        .filter_map(|o| {
+            Some(AddTarget {
+                playlist_id: o["playlistId"].as_str().filter(|s| !s.is_empty())?.to_string(),
+                title: text(&o["title"]).trim().to_string(),
+                has: o["containsSelectedVideos"].as_str() == Some("ALL"),
+            })
+        })
+        .collect()
+}
+
+pub fn add_to_playlist(playlist_id: &str, video_id: &str) -> Result<(), String> {
+    let id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    let root = post(
+        "browse/edit_playlist",
+        json!({"playlistId": id, "actions": [{"action": "ACTION_ADD_VIDEO", "addedVideoId": video_id, "dedupeOption": "DEDUPE_OPTION_SKIP"}]}),
+    )?;
+    match root["status"].as_str() {
+        Some("STATUS_SUCCEEDED") => Ok(()),
+        s => Err(format!("YouTube said {}", s.unwrap_or("nothing"))),
+    }
+}
+
+/// New private playlist holding `video_id`; returns its id.
+pub fn create_playlist(title: &str, video_id: &str) -> Result<String, String> {
+    let root = post("playlist/create", json!({"title": title, "privacyStatus": "PRIVATE", "videoIds": [video_id]}))?;
+    root["playlistId"].as_str().map(str::to_string).ok_or_else(|| "YouTube didn't create the playlist".into())
 }
 
 // ---- discover ----------------------------------------------------------------
@@ -629,6 +694,19 @@ mod tests {
         let c = normalize_cookies(txt).unwrap();
         assert_eq!(c, "SAPISID=q; SID=abc");
         assert_eq!(normalize_cookies(&netscape(&c)).unwrap(), c);
+    }
+
+    #[test]
+    fn add_targets_json() {
+        let root = json!({"contents": [{"addToPlaylistRenderer": {"playlists": [
+            {"playlistAddToOptionRenderer": {"playlistId": "PLabc", "title": {"simpleText": "Road trip"}, "containsSelectedVideos": "ALL"}},
+            {"playlistAddToOptionRenderer": {"playlistId": "PLdef", "title": {"runs": [{"text": "Chill"}]}, "containsSelectedVideos": "NONE"}},
+            {"playlistAddToOptionRenderer": {"title": {"simpleText": "broken"}}}
+        ]}}]});
+        let t = parse_add_targets(&root);
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].playlist_id.as_str(), t[0].title.as_str(), t[0].has), ("PLabc", "Road trip", true));
+        assert_eq!((t[1].title.as_str(), t[1].has), ("Chill", false));
     }
 
     #[test]

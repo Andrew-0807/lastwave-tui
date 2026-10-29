@@ -101,14 +101,40 @@ pub fn clean_title(title: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Separators between credited artists. " and " / " x " are left out:
+/// they are part of too many real names ("Simon and Garfunkel").
+pub const CREDIT_SEPS: &[&str] = &[", ", " & ", " feat. ", " ft. "];
+
+/// `name` minus YouTube's " - Topic" suffix, any case.
+pub fn strip_topic(name: &str) -> &str {
+    let n = name.trim_end();
+    match n.len().checked_sub(8) {
+        Some(i) if n.is_char_boundary(i) && n[i..].eq_ignore_ascii_case(" - topic") => &n[..i],
+        _ => n,
+    }
+}
+
 /// First credited artist ("A, B & C" -> "A"), minus YouTube's " - Topic".
 pub fn primary_artist(artist: &str) -> String {
-    let a = artist.trim_end_matches(" - Topic");
-    let mut cut = a.len();
-    for sep in [", ", " & ", " feat. ", " ft. ", " x ", " and "] {
-        if let Some(i) = a.to_lowercase().find(sep) {
-            cut = cut.min(i);
-        }
-    }
+    let a = strip_topic(artist);
+    // ASCII lowercasing keeps byte offsets valid for slicing `a`.
+    let lower = a.to_ascii_lowercase();
+    let cut = CREDIT_SEPS.iter().filter_map(|sep| lower.find(sep)).min().unwrap_or(a.len());
     a[..cut].trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_artist_credits() {
+        assert_eq!(primary_artist("Simon and Garfunkel"), "Simon and Garfunkel");
+        assert_eq!(primary_artist("Lil Nas X x Billy Ray"), "Lil Nas X x Billy Ray");
+        assert_eq!(primary_artist("A & B - topic"), "A");
+        assert_eq!(primary_artist("Foo Feat. Bar"), "Foo");
+        // Uppercase non-ASCII whose lowercase form is longer in bytes.
+        assert_eq!(primary_artist("İİİ Band, Other"), "İİİ Band");
+        assert_eq!(primary_artist("Ⱥⱥ & Ǆ - Topic"), "Ⱥⱥ");
+    }
 }

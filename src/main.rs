@@ -1,3 +1,4 @@
+mod aifilter;
 mod app;
 mod art;
 mod artdebug;

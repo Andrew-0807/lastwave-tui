@@ -17,6 +17,7 @@ use serde_json::Value;
 const ACCENT: Color = Color::Rgb(255, 208, 176);
 const DIM: Color = Color::DarkGray;
 const OK: Color = Color::Rgb(140, 220, 150);
+const LIKE: Color = Color::Rgb(255, 120, 140);
 
 fn block(title: impl Into<Line<'static>>) -> Block<'static> {
     Block::default()
@@ -54,6 +55,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Settings => draw_settings(f, main, app),
     }
     draw_player(f, player, app);
+    if app.picker.is_some() {
+        draw_picker(f, f.area(), app);
+        if let Some(c) = &mut app.covers {
+            c.begin_frame();
+        }
+    }
     if app.help {
         draw_help(f, f.area());
         // Kitty overlays sit above all text; keep them off the popup.
@@ -80,12 +87,22 @@ fn split_drawer(main: Rect) -> (Rect, Option<(Rect, bool)>) {
 
 /// Lay out clickable `[ label ]` buttons left to right, wrapping into rows.
 /// Returns the lines to render; registers each button's hit area on `app`.
-fn button_rows(app: &mut App, area: Rect, buttons: &[(&str, KeyCode)]) -> Vec<Line<'static>> {
+/// Outlined buttons: `[label]` in the accent colour, optionally followed by
+/// the dimmed key that does the same thing.
+fn button_rows(app: &mut App, area: Rect, buttons: &[(&str, KeyCode)], hints: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let (mut x, mut y) = (0u16, 0u16);
     for (label, code) in buttons {
-        let span = Span::styled(format!(" {label} "), Style::new().fg(Color::Black).bg(ACCENT).bold());
-        let w = span.width() as u16;
+        let mut spans = vec![Span::styled(format!("[{label}]"), Style::new().fg(ACCENT).bold())];
+        let hint = match code {
+            KeyCode::Char(c) if hints => Some(c.to_string()),
+            KeyCode::Enter if hints => Some("↵".into()),
+            _ => None,
+        };
+        if let Some(h) = hint.filter(|_| !label.contains(['(', '↵'])) {
+            spans.push(Span::styled(format!(" {h}"), Style::new().fg(DIM)));
+        }
+        let w = spans.iter().map(|s| s.width() as u16).sum::<u16>();
         if x > 0 && x + w > area.width {
             lines.push(Vec::new());
             (x, y) = (0, y + 1);
@@ -94,9 +111,9 @@ fn button_rows(app: &mut App, area: Rect, buttons: &[(&str, KeyCode)]) -> Vec<Li
             app.buttons.push((Rect::new(area.x + x, area.y + y, w.min(area.width), 1), *code));
         }
         let row = lines.last_mut().unwrap();
-        row.push(span);
-        row.push(Span::raw(" "));
-        x += w + 1;
+        row.extend(spans);
+        row.push(Span::raw("  "));
+        x += w + 2;
     }
     lines.into_iter().map(Line::from).collect()
 }
@@ -183,6 +200,10 @@ fn draw_details(f: &mut Frame, area: Rect, app: &mut App, side: bool) {
             if app.view == View::Search && t.video_id().is_some() {
                 btn.push(("≈ Radio", KeyCode::Char('r')));
             }
+            if ytm::signed_in() && t.video_id().is_some() {
+                btn.push((if app.is_liked(t) { "♥ Unlike" } else { "♡ Like" }, KeyCode::Char('l')));
+                btn.push(("+ Playlist", KeyCode::Char('P')));
+            }
             (t.art_key(), l, btn)
         }
         Highlight::Collection(c) => {
@@ -201,7 +222,7 @@ fn draw_details(f: &mut Frame, area: Rect, app: &mut App, side: bool) {
         }
     };
 
-    let btn_lines = button_rows(app, Rect::new(text.x, text.y, text.width, text.height), &buttons);
+    let btn_lines = button_rows(app, Rect::new(text.x, text.y, text.width, text.height), &buttons, true);
     // Buttons go at the bottom of the text area: shift their hit areas down.
     let nb = btn_lines.len() as u16;
     let btn_y = text.y + text.height.saturating_sub(nb);
@@ -215,20 +236,25 @@ fn draw_details(f: &mut Frame, area: Rect, app: &mut App, side: bool) {
     draw_cover(f, cover, app, art::DETAIL, &key);
 }
 
-fn track_item(t: &Track, playing: bool) -> ListItem<'static> {
+fn track_item(app: &App, t: &Track, playing: bool) -> ListItem<'static> {
     let dur = if t.duration > 0 { fmt_time(t.duration as f64) } else { String::new() };
     let mut spans = vec![
         Span::styled(if playing { "▶ " } else { "  " }, Style::new().fg(ACCENT)),
         Span::styled(format!("{dur:>6}  "), Style::new().fg(DIM)),
         Span::styled(t.title.clone(), if playing { Style::new().fg(ACCENT).bold() } else { Style::new().bold() }),
-        Span::raw("  "),
-        Span::raw(t.artist.clone()),
     ];
+    if app.is_liked(t) {
+        spans.push(Span::styled(" ♥", Style::new().fg(LIKE)));
+    }
+    spans.extend([Span::raw("  "), Span::raw(t.artist.clone())]);
     if !t.album.is_empty() {
         spans.push(Span::styled(format!(" · {}", t.album), Style::new().fg(DIM)));
     }
     if !t.quality.is_empty() {
         spans.push(Span::styled(format!("  [{}]", t.quality), Style::new().fg(OK)));
+    }
+    if app.is_ai(t) {
+        spans.push(Span::styled("  [AI]", Style::new().fg(DIM)));
     }
     ListItem::new(Line::from(spans))
 }
@@ -263,8 +289,8 @@ fn draw_search(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(line).block(block(title)), inp);
 
     if let Some((c, tracks)) = &app.browse {
-        let items: Vec<ListItem> = tracks.iter().map(|t| track_item(t, false)).collect();
-        let title = format!(" {} · {} · {} tracks  (Esc back, Enter play from here, A queue all) ", c.title, c.subtitle, tracks.len());
+        let items: Vec<ListItem> = tracks.iter().map(|t| track_item(app, t, false)).collect();
+        let title = format!(" {} · {} · {} tracks  (Esc back, Enter play from here, A queue all, l like, P +playlist) ", c.title, c.subtitle, tracks.len());
         let w = List::new(items).block(block(title)).highlight_style(hl());
         f.render_stateful_widget(w, list, &mut app.browse_sel);
         app.list_area = Some(list);
@@ -278,9 +304,9 @@ fn draw_search(f: &mut Frame, area: Rect, app: &mut App) {
     app.list_area = Some(list);
     match &app.results {
         Some(Results::Tracks(t)) => {
-            let items: Vec<ListItem> = t.iter().map(|t| track_item(t, false)).collect();
+            let items: Vec<ListItem> = t.iter().map(|t| track_item(app, t, false)).collect();
             let w = List::new(items)
-                .block(block(format!(" Songs{busy}  (Enter play, N play next, a queue, r radio, A queue all) ")))
+                .block(block(format!(" Songs{busy}  (Enter play, N play next, a queue, r radio, A queue all, l like, P +playlist) ")))
                 .highlight_style(hl());
             f.render_stateful_widget(w, list, &mut app.search_sel);
         }
@@ -304,7 +330,7 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|d| match d {
             DItem::Header(t) => ListItem::new(Line::styled(format!("── {t} "), Style::new().fg(ACCENT).bold())),
-            DItem::Track(t) => track_item(t, false),
+            DItem::Track(t) => track_item(app, t, false),
             DItem::Coll(c) => coll_item(c),
         })
         .collect();
@@ -314,7 +340,7 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &mut App) {
         "· YouTube Music home (sign in for your own picks)".into()
     };
     let busy = if app.discover_loading { " · loading…" } else { "" };
-    let title = format!(" Discover {who}{busy}  (Enter play/open, N next, a queue, r radio, S refresh) ");
+    let title = format!(" Discover {who}{busy}  (Enter play/open, N next, a queue, r radio, l like, P +playlist, S refresh) ");
     if items.is_empty() {
         let msg = if app.discover_loading { "Loading recommendations…" } else { "Nothing to show — press S to retry" };
         f.render_widget(Paragraph::new(msg).fg(DIM).block(block(title)), area);
@@ -326,9 +352,9 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_queue(f: &mut Frame, area: Rect, app: &mut App) {
-    let items: Vec<ListItem> = app.queue.iter().enumerate().map(|(i, t)| track_item(t, app.cur == Some(i))).collect();
+    let items: Vec<ListItem> = app.queue.iter().enumerate().map(|(i, t)| track_item(app, t, app.cur == Some(i))).collect();
     let title = format!(
-        " Queue · {} tracks · radio {}  (Enter play, N play next, d remove, J/K move, c current, X clear) ",
+        " Queue · {} tracks · radio {}  (Enter play, N play next, d remove, J/K move, c current, X clear, l like, P +playlist) ",
         app.queue.len(),
         if app.cfg.radio { "on" } else { "off" }
     );
@@ -373,7 +399,7 @@ fn draw_library(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let vis = app.lib_visible();
-    let items: Vec<ListItem> = vis.iter().map(|&i| track_item(&app.library[i], false)).collect();
+    let items: Vec<ListItem> = vis.iter().map(|&i| track_item(app, &app.library[i], false)).collect();
     let scanning = if app.lib_scanning { " · scanning…" } else { "" };
     let title = format!(
         " {} · {} of {}{scanning}  (Enter play, N play next, a queue, A queue all) ",
@@ -399,15 +425,15 @@ fn draw_library_yt(f: &mut Frame, area: Rect, app: &mut App) {
             Line::raw(""),
         ];
         let y = inner.y + lines.len() as u16;
-        let btn = button_rows(app, Rect::new(inner.x, y, inner.width, 1), &[("Sign in (L)", KeyCode::Char('L'))]);
+        let btn = button_rows(app, Rect::new(inner.x, y, inner.width, 1), &[("Sign in (L)", KeyCode::Char('L'))], false);
         lines.extend(btn);
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
         return;
     }
     let busy = if app.yt_loading { " · loading…" } else { "" };
     if let Some((c, tracks)) = &app.yt_open {
-        let items: Vec<ListItem> = tracks.iter().map(|t| track_item(t, false)).collect();
-        let title = format!(" {} · {} tracks{busy}  (Esc back, Enter play from here, N next, a queue, A all, r radio) ", c.title, tracks.len());
+        let items: Vec<ListItem> = tracks.iter().map(|t| track_item(app, t, false)).collect();
+        let title = format!(" {} · {} tracks{busy}  (Esc back, Enter play from here, N next, a queue, A all, r radio, l like, P +playlist) ", c.title, tracks.len());
         let w = List::new(items).block(block(title)).highlight_style(hl());
         f.render_stateful_widget(w, area, &mut app.yt_open_sel);
     } else {
@@ -578,10 +604,11 @@ fn draw_player(f: &mut Frame, area: Rect, app: &mut App) {
     let icon = if app.idle { "■" } else if app.paused { "‖" } else { "▶" };
     match app.current() {
         Some(t) => {
-            f.render_widget(
-                Line::from(vec![Span::styled(format!("{icon} "), Style::new().fg(ACCENT)), Span::styled(t.title.clone(), Style::new().bold())]),
-                l1,
-            );
+            let mut title = vec![Span::styled(format!("{icon} "), Style::new().fg(ACCENT)), Span::styled(t.title.clone(), Style::new().bold())];
+            if app.is_liked(t) {
+                title.push(Span::styled(" ♥", Style::new().fg(LIKE)));
+            }
+            f.render_widget(Line::from(title), l1);
             let mut sub = vec![Span::raw(format!("  {}", t.artist))];
             if !t.album.is_empty() {
                 sub.push(Span::styled(format!(" · {}", t.album), Style::new().fg(DIM)));
@@ -631,13 +658,45 @@ fn draw_player(f: &mut Frame, area: Rect, app: &mut App) {
         ("▶▶", KeyCode::Char('n')),
         ("−", KeyCode::Char('-')),
         ("+", KeyCode::Char('+')),
+        ("≈ Radio", KeyCode::Char('w')),
     ];
-    let mut row = button_rows(app, l5, &controls).into_iter().next().unwrap_or_default();
+    let mut row = button_rows(app, l5, &controls, false).into_iter().next().unwrap_or_default();
     row.spans.push(Span::styled(
         format!(" vol {:.0}%{}", app.volume, if app.cfg.radio { " · radio" } else { "" }),
         Style::new().fg(DIM),
     ));
     f.render_widget(row, l5);
+}
+
+fn draw_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(p) = &mut app.picker else { return };
+    let new_row = if app.input == Some(Input::NewPlaylist) {
+        Line::from(vec![
+            Span::styled("  + ", Style::new().fg(ACCENT)),
+            Span::raw(app.input_buf.clone()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ])
+    } else {
+        Line::styled("  + New playlist…", Style::new().fg(ACCENT))
+    };
+    let mut items = vec![ListItem::new(new_row)];
+    items.extend(p.items.iter().map(|t| {
+        if t.has {
+            ListItem::new(Line::styled(format!("✓ {}", t.title), Style::new().fg(DIM)))
+        } else {
+            ListItem::new(Line::raw(format!("  {}", t.title)))
+        }
+    }));
+    if p.loading {
+        items.push(ListItem::new(Line::styled("  loading playlists…", Style::new().fg(DIM))));
+    }
+    let name: String = p.track.title.chars().take(28).collect();
+    let w = 56.min(area.width);
+    let h = (items.len() as u16 + 2).min(area.height).min(22);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    f.render_widget(Clear, r);
+    let w = List::new(items).block(block(format!(" Add “{name}” to… (Enter add, Esc close) "))).highlight_style(hl());
+    f.render_stateful_widget(w, r, &mut p.sel);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -648,7 +707,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("n / p", "next / previous"),
         ("← → , .", "seek 5s / 10s"),
         ("+ / -", "volume"),
+        ("w", "radio from the playing song"),
         ("R", "toggle radio autoplay"),
+        ("B", "flag / unflag playing artist as AI"),
+        ("l", "like / unlike song (highlighted, else playing)"),
+        ("P", "add song to a YouTube Music playlist"),
         ("/", "search (from any view; empty = Discover)"),
         ("v", "show / hide details drawer"),
         ("mouse", "click buttons/tabs, double-click plays, wheel scrolls"),
