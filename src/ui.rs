@@ -353,7 +353,7 @@ fn draw_details(f: &mut Frame, area: Rect, app: &mut App, side: bool) {
             } else {
                 vec![("▶ Play", KeyCode::Enter), ("⤵ Play next", KeyCode::Char('N')), ("+ Queue", KeyCode::Char('a'))]
             };
-            if app.view == View::Search && t.video_id().is_some() {
+            if t.video_id().is_some() {
                 btn.push(("≈ Radio", KeyCode::Char('r')));
             }
             if ytm::signed_in() && t.video_id().is_some() {
@@ -492,7 +492,7 @@ fn input_line(app: &App, target: Input, value: &str, placeholder: &str) -> Line<
 fn draw_search(f: &mut Frame, area: Rect, app: &mut App) {
     // The search box is one unboxed line above the results.
     let [inp, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-    let kind = format!(" {} · f ", app.kind.label());
+    let kind = format!(" {} · t ", app.kind.label());
     let [field, kind_area] = Layout::horizontal([Constraint::Min(1), Constraint::Length(str_width(&kind) as u16)]).areas(inp);
     let placeholder = if field.width >= 70 {
         "/ to search songs, artists, albums — or paste a YouTube link. Empty = Discover"
@@ -524,7 +524,7 @@ fn draw_search(f: &mut Frame, area: Rect, app: &mut App) {
     let mut st = std::mem::take(&mut app.search_sel);
     match &app.results {
         Some(Results::Tracks(t)) => {
-            let b = block(format!(" Songs{busy}  (Enter play, N play next, a queue, r radio, A queue all, l like, P +playlist) "));
+            let b = block(format!(" Songs{busy}  (Enter play from here, N play next, a queue, r radio, A queue all, l like, P +playlist) "));
             render_list(f, list, b, &mut st, t.len(), |i| track_item(app, &t[i], is_playing(app, &t[i]), &cols));
         }
         Some(Results::Collections(cs)) => {
@@ -615,12 +615,18 @@ fn draw_library(f: &mut Frame, area: Rect, app: &mut App) {
     let mut st = std::mem::take(&mut app.lib_sel);
     let vis = app.lib_visible();
     let scanning = if app.lib_scanning { " · scanning…" } else { "" };
+    let dir = if app.cfg.library_dir.is_empty() { "No music folder" } else { app.cfg.library_dir.as_str() };
     let title = format!(
-        " {} · {} of {}{scanning}  (Enter play, N play next, a queue, A queue all) ",
-        app.cfg.library_dir,
+        " {dir} · {} of {}{scanning}  (Enter play from here, N play next, a queue, A queue all) ",
         vis.len(),
         app.library.len()
     );
+    if vis.is_empty() {
+        app.lib_sel = st;
+        let lines = library_hint(app);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block(title)), list);
+        return;
+    }
     let cols = Cols::for_list(list);
     render_list(f, list, block(title), &mut st, vis.len(), |k| {
         let t = &app.library[vis[k]];
@@ -628,6 +634,41 @@ fn draw_library(f: &mut Frame, area: Rect, app: &mut App) {
     });
     app.lib_sel = st;
     app.list_area = Some(list);
+}
+
+/// What the local Library shows instead of an empty list: how to get songs into it.
+fn library_hint(app: &App) -> Vec<Line<'static>> {
+    let dir = &app.cfg.library_dir;
+    let key = |k: &str| Span::styled(k.to_string(), accent().bold());
+    let mut lines = if app.lib_scanning {
+        vec![Line::raw(format!("Scanning {dir}…"))]
+    } else if dir.is_empty() {
+        vec![
+            Line::styled("No music folder set yet.", Style::new().bold()),
+            Line::raw(""),
+            Line::from(vec![Span::raw("Press "), key("o"), Span::raw(" and type the path of the folder with your music files (also in Settings → Library folder).")]),
+            Line::styled("FLAC, ALAC, WAV, DSD, MP3, Opus and more are found in all its subfolders and sorted by their tags.", dim()),
+        ]
+    } else if let Some(e) = &app.lib_error {
+        vec![
+            Line::styled(e.clone(), Style::new().bold()),
+            Line::raw(""),
+            Line::from(vec![Span::raw("Press "), key("o"), Span::raw(" to pick another folder, or "), key("S"), Span::raw(" to scan again.")]),
+        ]
+    } else if !app.library.is_empty() {
+        vec![Line::from(vec![Span::raw(format!("No songs match “{}”. ", app.lib_filter())), key("Esc"), Span::raw(" clears the filter.")])]
+    } else {
+        vec![
+            Line::styled(format!("No audio files found in {dir}."), Style::new().bold()),
+            Line::raw(""),
+            Line::from(vec![Span::raw("Press "), key("o"), Span::raw(" to pick another folder, or "), key("S"), Span::raw(" to scan again.")]),
+        ]
+    };
+    if app.library.is_empty() && !app.lib_scanning {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![key("y"), Span::styled(" switches to your YouTube Music library; / searches YouTube Music.", dim())]));
+    }
+    lines
 }
 
 fn draw_library_yt(f: &mut Frame, area: Rect, app: &mut App) {
@@ -720,12 +761,12 @@ fn draw_eq(f: &mut Frame, area: Rect, app: &App) {
     let clarity = if e.clarity { "on" } else { "off" };
     let profile = eq::CLARITY[e.clarity_preset.min(eq::CLARITY.len() - 1)].0;
     let mut title = format!(" Equalizer · {state} · preset {} · Studio Clarity {clarity} ({profile}) ", e.preset);
-    let mut keys = " ←/→ band  ↑/↓ gain  e toggle  [ ] preset  c clarity  C clarity profile  z reset ";
+    let mut keys = " ←/→ band  ↑/↓ gain  e on/off  [ ] preset  s clarity  { } clarity profile  z reset ";
     if str_width(&title) + 2 > area.width as usize {
         title = format!(" EQ · {state} · {} · Clarity {clarity} ", e.preset);
     }
     if str_width(keys) + 2 > area.width as usize {
-        keys = " ←→ band  ↑↓ gain  e on/off  [ ] preset  c/C clarity  z reset ";
+        keys = " ←→ band  ↑↓ gain  e on/off  [ ] preset  s { } clarity  z reset ";
     }
     let b = block(title).title_bottom(Line::from(keys).right_aligned());
     let inner = b.inner(area);
@@ -767,7 +808,9 @@ fn draw_eq(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
-    let [list, info] = Layout::vertical([Constraint::Length(SETTINGS.len() as u16 + 2), Constraint::Min(3)]).areas(area);
+    // A pending Last.fm link gets room in the notes so it can be read (and copied) in full.
+    let notes_h = if app.lfm_auth.is_some() { 6 } else { 3 };
+    let [list, info] = Layout::vertical([Constraint::Length(SETTINGS.len() as u16 + 2), Constraint::Min(notes_h)]).areas(area);
     let name_w = if list.width >= 60 { 26 } else { 20 };
     let row = |i: usize| {
         let name = SETTINGS[i];
@@ -796,7 +839,13 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         b = b.title_bottom(Line::styled(format!(" {}/{} ", app.set_sel + 1, SETTINGS.len()), dim()).right_aligned());
     }
     render_list(f, list, b, &mut st, SETTINGS.len(), row);
-    let text = vec![
+    let mut text = Vec::new();
+    if let Some((_, url)) = &app.lfm_auth {
+        text.push(Line::styled("Last.fm: open this link, approve LastWave, then press Enter on \"Last.fm account\" (Esc cancels):", accent().bold()));
+        text.push(Line::raw(url.clone()));
+        text.push(Line::raw(""));
+    }
+    text.extend([
         Line::raw("Bit-perfect sends the decoded stream to the device in WASAPI exclusive mode (CoreAudio hog / ALSA on other OSes):"),
         Line::raw("no mixer, no resampling, no EQ, no ReplayGain, volume fixed at 100%. Best with local FLAC/ALAC."),
         Line::raw("YouTube streams top out at ~160 kbps Opus / 128-256 kbps AAC; they are resolved by mpv's yt-dlp hook (keep yt-dlp updated)."),
@@ -804,7 +853,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         Line::raw("YouTube Music sign-in: open music.youtube.com signed in → F12 → Network → any request → copy the `cookie` request header and paste it on \"YouTube Music account\" (a cookies.txt path works too). Cookies are stored in plain text next to the config file; signing out of that browser session invalidates them. \"Use account for playback\" passes them to yt-dlp for Premium formats and age-restricted songs."),
         Line::raw(""),
         Line::styled(format!("Config file: {}", app.config_path()), dim()),
-    ];
+    ]);
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }).block(block(" Notes ")), info);
 }
 
@@ -935,38 +984,77 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(w, r, &mut p.sel);
 }
 
-const HELP_GLOBAL: &[(&str, &str)] = &[
-    ("1-6 / Tab", "switch view"),
-    ("Space", "play / pause"),
-    ("n / p", "next / previous"),
-    ("← → , .", "seek 5s / 10s"),
-    ("+ / -", "volume"),
-    ("w", "radio from the playing song"),
-    ("R", "toggle radio autoplay"),
-    ("B", "flag / unflag playing artist as AI"),
-    ("l", "like / unlike (highlighted, else playing)"),
-    ("P", "add song to a YouTube Music playlist"),
-    ("/", "search (from any view; empty = Discover)"),
-    ("v", "show / hide details drawer"),
-    ("mouse", "click, double-click plays, wheel scrolls"),
-    ("q / Ctrl+C", "quit"),
-];
-
-const HELP_LISTS: &[(&str, &str)] = &[
-    ("↑↓ j k", "move"),
-    ("PgUp PgDn g G", "page / top / bottom"),
-    ("Enter", "play / open"),
-    ("a / A", "add selected / all to queue"),
-    ("N", "play next (after current song)"),
-    ("r", "start radio from song (Search)"),
-    ("Esc", "back / clear search → Discover"),
-    ("S", "refresh Discover / playlists / library"),
-    ("y", "Library: Local files ↔ YouTube Music"),
-    ("f", "Search: Songs/Albums/…  Library: filter"),
-    ("u", "undo queue change"),
-    ("", "(Enter r w X d/Del B)"),
-    ("", "up to 10 steps back"),
-    ("Settings", "sign out: Enter twice"),
+/// Every key, grouped (KEYS.md has the same list). Sized so that all of it
+/// fits in two columns on an 80x24 terminal.
+pub(crate) const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Player (always the playing song)",
+        &[
+            ("Space", "play / pause"),
+            ("n p", "next / previous"),
+            ("← → , .", "seek 5s / 10s"),
+            ("+ -", "volume"),
+            ("w", "radio from playing song"),
+            ("B", "flag playing artist as AI"),
+            ("R", "radio autoplay on/off"),
+        ],
+    ),
+    (
+        "App",
+        &[
+            ("1-6 Tab", "switch view (⇧Tab back)"),
+            ("/", "search YouTube Music"),
+            ("c", "playing song in Queue"),
+            ("v", "details drawer"),
+            ("L", "sign in to YouTube Music"),
+            ("u", "undo queue change"),
+            ("? q Ctrl+C", "this help / quit"),
+        ],
+    ),
+    (
+        "Song (highlighted, else playing)",
+        &[
+            ("Enter", "play from here / open album"),
+            ("N a", "play next / add to queue"),
+            ("A", "add the whole list to queue"),
+            ("r", "radio from the song"),
+            ("l P", "like / add to playlist"),
+        ],
+    ),
+    (
+        "Lists",
+        &[
+            ("↑↓ j k", "move"),
+            ("PgUp PgDn g G", "page / top / bottom"),
+            ("Esc ⌫", "back / clear"),
+            ("S", "refresh / rescan"),
+            ("mouse", "click / double-click"),
+        ],
+    ),
+    (
+        "Views",
+        &[
+            ("t", "Search: result type"),
+            ("d Del", "Queue: remove"),
+            ("J K X", "Queue: move / clear"),
+            ("y", "Library: local ↔ YouTube"),
+            ("f o", "Library: filter / folder"),
+            ("← → ↑↓", "EQ: band / gain"),
+            ("e z", "EQ: on/off / reset"),
+            ("[ ]", "EQ: preset"),
+            ("s { }", "EQ: Clarity / profile"),
+            ("← → Enter", "Settings: change"),
+            ("Enter ×2", "Settings: sign out"),
+        ],
+    ),
+    (
+        "Typing",
+        &[
+            ("Enter Esc", "confirm / cancel"),
+            ("Ctrl+U Ctrl+V", "clear / paste cookies"),
+            ("click", "keeps the text"),
+        ],
+    ),
 ];
 
 fn help_lines(title: &'static str, rows: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
@@ -981,16 +1069,14 @@ fn help_lines(title: &'static str, rows: &[(&str, &str)], width: usize) -> Vec<L
     lines
 }
 
-/// Key help: one column when it fits, else two side by side.
+/// Key help: one column when it fits, else two side by side (sections flow
+/// into the second column; what still doesn't fit is cut off at the bottom).
 fn draw_help(f: &mut Frame, area: Rect) {
-    let one_col_h = (HELP_GLOBAL.len() + HELP_LISTS.len() + 3 + 2) as u16;
+    let total: usize = HELP.iter().map(|(_, rows)| rows.len() + 1).sum();
+    // One column has a blank line between sections.
+    let one_col_h = (total + HELP.len() - 1 + 2) as u16;
     let two_cols = area.height < one_col_h && area.width >= 60;
-    let (w, h) = if two_cols {
-        (area.width.min(130), (HELP_GLOBAL.len().max(HELP_LISTS.len()) + 1 + 2) as u16)
-    } else {
-        (area.width.min(64), one_col_h)
-    };
-    let h = h.min(area.height);
+    let (w, h) = if two_cols { (area.width.min(130), area.height) } else { (area.width.min(64), one_col_h.min(area.height)) };
     let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, r);
     let b = block(" Keys (any key closes) ");
@@ -999,12 +1085,22 @@ fn draw_help(f: &mut Frame, area: Rect) {
     if two_cols {
         let [left, _, right] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
-        f.render_widget(Paragraph::new(help_lines("Global", HELP_GLOBAL, left.width as usize)), left);
-        f.render_widget(Paragraph::new(help_lines("Lists", HELP_LISTS, right.width as usize)), right);
+        let (mut l, mut rt) = (Vec::new(), Vec::new());
+        for (title, rows) in HELP {
+            // Fill the left column first; a section never splits across columns.
+            let col = if rt.is_empty() && l.len() + rows.len() < inner.height as usize { &mut l } else { &mut rt };
+            col.extend(help_lines(title, rows, left.width as usize));
+        }
+        f.render_widget(Paragraph::new(l), left);
+        f.render_widget(Paragraph::new(rt), right);
     } else {
-        let mut lines = help_lines("Global", HELP_GLOBAL, inner.width as usize);
-        lines.push(Line::raw(""));
-        lines.extend(help_lines("Lists", HELP_LISTS, inner.width as usize));
+        let mut lines = Vec::new();
+        for (i, (title, rows)) in HELP.iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            lines.extend(help_lines(title, rows, inner.width as usize));
+        }
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -1065,5 +1161,12 @@ mod tests {
         let screen: String = (0..24).map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect();
         // Both sections, down to their last rows, are on screen.
         assert!(screen.contains("quit") && screen.contains("Library: "), "{screen}");
+        // Every section and every row, keys and descriptions uncut.
+        for (title, rows) in HELP {
+            assert!(screen.contains(title), "{title} missing:\n{screen}");
+            for (k, d) in *rows {
+                assert!(screen.contains(k) && screen.contains(d), "{k} / {d} missing or cut:\n{screen}");
+            }
+        }
     }
 }

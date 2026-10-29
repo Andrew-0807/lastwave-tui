@@ -66,8 +66,10 @@ pub enum Msg {
     Lyrics(String, Option<Lyrics>),
     Library(Result<Vec<Track>, String>),
     Status(String),
-    LfmToken(Result<String, String>),
-    LfmSession(Result<(String, String), String>),
+    /// (connect attempt, token)
+    LfmToken(u64, Result<String, String>),
+    /// (connect attempt, (session key, user name))
+    LfmSession(u64, Result<(String, String), lastfm::LfmError>),
     Art(String, Option<DynamicImage>),
     AiList(Result<usize, String>),
     Liked(Result<HashSet<String>, String>),
@@ -166,7 +168,7 @@ struct Cache {
 const CACHE_FILE: &str = "cache.json";
 const MAX_CACHED_PAGES: usize = 24;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LibMode {
     Local,
     Yt,
@@ -186,7 +188,7 @@ pub enum Highlight {
     Collection(Collection),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Search,
     Queue,
@@ -210,7 +212,154 @@ impl View {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// What a key does. Keys become actions in one place: `global_act` (same
+/// meaning in every view), else `view_act` (keys only one view uses). A view
+/// never rebinds a global key; see KEYS.md and the `keymap_*` tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Act {
+    // App
+    Quit,
+    Help,
+    ShowView(usize),
+    /// true: backwards
+    CycleView(bool),
+    Search,
+    Details,
+    ShowPlaying,
+    SignInYt,
+    Undo,
+    // Player: always the playing song
+    PlayPause,
+    Next,
+    Prev,
+    Seek(i32),
+    Volume(i32),
+    RadioPlaying,
+    FlagAi,
+    Autoplay,
+    // The highlighted row (else the playing song)
+    Activate,
+    PlayNext,
+    AddToQueue,
+    AddAll,
+    Radio,
+    Like,
+    AddToPlaylist,
+    // Lists
+    Back,
+    Refresh,
+    Move(isize),
+    // Search
+    SearchType,
+    // Queue
+    Remove,
+    /// true: up
+    Shift(bool),
+    ClearQueue,
+    // Library
+    LibSource(Option<LibMode>),
+    Filter,
+    Folder,
+    // Equalizer
+    EqBand(i8),
+    EqGain(i8),
+    EqToggle,
+    /// true: next
+    EqPreset(bool),
+    EqReset,
+    Clarity,
+    /// true: next
+    ClarityProfile(bool),
+    // Settings: true = backwards
+    Change(bool),
+}
+
+/// Far enough to reach either end of any list.
+const FAR: isize = 1 << 30;
+
+/// Keys with one meaning in every view (outside text fields and pop-ups).
+pub fn global_act(code: KeyCode) -> Option<Act> {
+    Some(match code {
+        KeyCode::Char('q') => Act::Quit,
+        KeyCode::Char('?') => Act::Help,
+        KeyCode::Char(c @ '1'..='6') => Act::ShowView((c as u8 - b'1') as usize),
+        KeyCode::Tab => Act::CycleView(false),
+        KeyCode::BackTab => Act::CycleView(true),
+        KeyCode::Char('/') => Act::Search,
+        KeyCode::Char('v') => Act::Details,
+        KeyCode::Char('c') => Act::ShowPlaying,
+        KeyCode::Char('L') => Act::SignInYt,
+        KeyCode::Char('u') => Act::Undo,
+        KeyCode::Char(' ') => Act::PlayPause,
+        KeyCode::Char('n') => Act::Next,
+        KeyCode::Char('p') => Act::Prev,
+        KeyCode::Char(',') => Act::Seek(-10),
+        KeyCode::Char('.') => Act::Seek(10),
+        KeyCode::Char('+') | KeyCode::Char('=') => Act::Volume(5),
+        KeyCode::Char('-') => Act::Volume(-5),
+        KeyCode::Char('w') => Act::RadioPlaying,
+        KeyCode::Char('B') => Act::FlagAi,
+        KeyCode::Char('R') => Act::Autoplay,
+        KeyCode::Enter => Act::Activate,
+        KeyCode::Esc | KeyCode::Backspace => Act::Back,
+        KeyCode::Char('S') => Act::Refresh,
+        KeyCode::Char('N') => Act::PlayNext,
+        KeyCode::Char('a') => Act::AddToQueue,
+        KeyCode::Char('A') => Act::AddAll,
+        KeyCode::Char('r') => Act::Radio,
+        KeyCode::Char('l') => Act::Like,
+        KeyCode::Char('P') => Act::AddToPlaylist,
+        _ => return None,
+    })
+}
+
+/// Keys only some views use: moving around, and each view's own commands.
+pub fn view_act(view: View, code: KeyCode) -> Option<Act> {
+    let list = matches!(view, View::Search | View::Queue | View::Library | View::Settings);
+    let moved = match code {
+        KeyCode::Up | KeyCode::Char('k') => Some(-1),
+        KeyCode::Down | KeyCode::Char('j') => Some(1),
+        KeyCode::PageUp => Some(-15),
+        KeyCode::PageDown => Some(15),
+        KeyCode::Home | KeyCode::Char('g') => Some(-FAR),
+        KeyCode::End | KeyCode::Char('G') => Some(FAR),
+        _ => None,
+    };
+    if let (true, Some(d)) = (list, moved) {
+        return Some(Act::Move(d));
+    }
+    Some(match (view, code) {
+        (View::Search | View::Queue | View::Library | View::Lyrics, KeyCode::Left) => Act::Seek(-5),
+        (View::Search | View::Queue | View::Library | View::Lyrics, KeyCode::Right) => Act::Seek(5),
+        (View::Search, KeyCode::Char('t')) => Act::SearchType,
+        (View::Queue, KeyCode::Char('d') | KeyCode::Delete) => Act::Remove,
+        (View::Queue, KeyCode::Char('K')) => Act::Shift(true),
+        (View::Queue, KeyCode::Char('J')) => Act::Shift(false),
+        (View::Queue, KeyCode::Char('X')) => Act::ClearQueue,
+        (View::Library, KeyCode::Char('y')) => Act::LibSource(None),
+        // The clickable source tabs.
+        (View::Library, KeyCode::F(11)) => Act::LibSource(Some(LibMode::Local)),
+        (View::Library, KeyCode::F(12)) => Act::LibSource(Some(LibMode::Yt)),
+        (View::Library, KeyCode::Char('f')) => Act::Filter,
+        (View::Library, KeyCode::Char('o')) => Act::Folder,
+        (View::Eq, KeyCode::Left) => Act::EqBand(-1),
+        (View::Eq, KeyCode::Right) => Act::EqBand(1),
+        (View::Eq, KeyCode::Up | KeyCode::Char('k')) => Act::EqGain(1),
+        (View::Eq, KeyCode::Down | KeyCode::Char('j')) => Act::EqGain(-1),
+        (View::Eq, KeyCode::Char('e')) => Act::EqToggle,
+        (View::Eq, KeyCode::Char('[')) => Act::EqPreset(false),
+        (View::Eq, KeyCode::Char(']')) => Act::EqPreset(true),
+        (View::Eq, KeyCode::Char('z')) => Act::EqReset,
+        (View::Eq, KeyCode::Char('s')) => Act::Clarity,
+        (View::Eq, KeyCode::Char('{')) => Act::ClarityProfile(false),
+        (View::Eq, KeyCode::Char('}')) => Act::ClarityProfile(true),
+        (View::Settings, KeyCode::Left) => Act::Change(true),
+        (View::Settings, KeyCode::Right) => Act::Change(false),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Input {
     Search,
     LibFilter,
@@ -282,6 +431,8 @@ pub struct App {
     lib_vis: Vec<usize>,
     pub lib_sel: ListState,
     pub lib_scanning: bool,
+    /// Why the library folder can't be scanned (shown in the empty Library view).
+    pub lib_error: Option<String>,
     pub lib_mode: LibMode,
     pub yt_lists: Vec<Collection>,
     pub yt_lists_sel: ListState,
@@ -312,7 +463,12 @@ pub struct App {
     pub eq_band: usize,
     pub set_sel: usize,
     pub devices: Vec<(String, String)>,
-    lfm_token: Option<String>,
+    /// Last.fm connect in progress: (token, approval URL) once Last.fm handed out a token.
+    pub lfm_auth: Option<(String, String)>,
+    /// A Last.fm connect request is on its way.
+    pub lfm_busy: bool,
+    /// Bumped when a connect attempt starts over or is cancelled; stale replies are dropped.
+    lfm_seq: u64,
 
     pub covers: Option<Covers>,
     /// Clickable regions laid out by the last draw: (area, key it presses).
@@ -420,6 +576,7 @@ impl App {
             lib_vis: Vec::new(),
             lib_sel: ListState::default(),
             lib_scanning: false,
+            lib_error: None,
             lib_mode: LibMode::Local,
             yt_lists: Vec::new(),
             yt_lists_sel: ListState::default(),
@@ -446,7 +603,9 @@ impl App {
             eq_band: 0,
             set_sel: 0,
             devices: Vec::new(),
-            lfm_token: None,
+            lfm_auth: None,
+            lfm_busy: false,
+            lfm_seq: 0,
             covers: None,
             buttons: Vec::new(),
             list_area: None,
@@ -568,21 +727,34 @@ impl App {
         t.video_id().is_some_and(|id| self.liked.contains(id))
     }
 
-    /// The highlighted song, else the playing one.
-    fn action_track(&self) -> Option<Track> {
-        match self.highlighted() {
+    /// What song actions apply to: the highlighted row of the view's list,
+    /// else (no list, or nothing in it) the playing song.
+    fn target(&self) -> Option<Highlight> {
+        self.highlighted().or_else(|| self.current().cloned().map(Highlight::Track))
+    }
+
+    /// The song `target` points at; says why not when it's an album/playlist or nothing.
+    fn target_track(&mut self, verb: &str) -> Option<Track> {
+        match self.target() {
             Some(Highlight::Track(t)) => Some(t),
-            _ => self.current().cloned(),
+            Some(Highlight::Collection(c)) => {
+                self.status = format!("Open {} (Enter) and pick a song to {verb}", c.title);
+                None
+            }
+            None => {
+                self.status = "Nothing highlighted or playing".into();
+                None
+            }
         }
     }
 
     /// The song an account action applies to and its video id, or why there is none.
-    fn account_target(&mut self, what: &str) -> Option<(Track, String)> {
+    fn account_target(&mut self, what: &str, verb: &str) -> Option<(Track, String)> {
         if !ytm::signed_in() {
-            self.status = format!("Sign in to YouTube Music (Library → y) to {what}");
+            self.status = format!("Sign in to YouTube Music (L) to {what}");
             return None;
         }
-        let t = self.action_track()?;
+        let t = self.target_track(verb)?;
         match t.video_id().map(str::to_string) {
             Some(id) => Some((t, id)),
             None => {
@@ -593,7 +765,7 @@ impl App {
     }
 
     fn toggle_like(&mut self) {
-        let Some((t, id)) = self.account_target("like songs") else { return };
+        let Some((t, id)) = self.account_target("like songs", "like it") else { return };
         let liked = !self.liked.contains(&id);
         if liked {
             self.liked.insert(id.clone());
@@ -608,7 +780,7 @@ impl App {
     }
 
     fn open_picker(&mut self) {
-        let Some((t, id)) = self.account_target("add to playlists") else { return };
+        let Some((t, id)) = self.account_target("add to playlists", "add it to a playlist") else { return };
         let mut sel = ListState::default();
         sel.select(Some(0));
         self.picker = Some(Picker { track: t, items: Vec::new(), sel, loading: true });
@@ -1066,20 +1238,6 @@ impl App {
         (self.cfg.lastfm_api_key.clone(), self.cfg.lastfm_api_secret.clone(), self.cfg.lastfm_session.clone())
     }
 
-    pub fn play_now(&mut self, t: Track) {
-        let i = match self.cur {
-            Some(c) => {
-                self.queue.insert(c + 1, t);
-                c + 1
-            }
-            None => {
-                self.queue.push(t);
-                self.queue.len() - 1
-            }
-        };
-        self.play_index(i);
-    }
-
     pub fn play_list(&mut self, tracks: Vec<Track>, start: usize) {
         if tracks.is_empty() {
             return;
@@ -1366,10 +1524,12 @@ impl App {
 
     fn rescan(&mut self) {
         let dir = PathBuf::from(&self.cfg.library_dir);
+        self.lib_error = None;
         if self.cfg.library_dir.is_empty() {
             return;
         }
         if let Err(e) = library::check_dir(&dir) {
+            self.lib_error = Some(e.clone());
             self.status = e;
             return;
         }
@@ -1424,10 +1584,13 @@ impl App {
             return (i < tracks.len()).then(|| (tracks.clone(), i));
         }
         if self.discover_mode() {
-            return match self.discover_sel.selected().and_then(|i| self.discover.get(i)) {
-                Some(DItem::Track(t)) => Some((vec![t.clone()], 0)),
-                _ => None,
-            };
+            // A Discover song's list is its shelf: the songs between the headers around it.
+            let i = self.discover_sel.selected().filter(|&i| matches!(self.discover.get(i), Some(DItem::Track(_))))?;
+            let start = self.discover[..i].iter().rposition(|d| matches!(d, DItem::Header(_))).map_or(0, |h| h + 1);
+            let end = self.discover[i..].iter().position(|d| matches!(d, DItem::Header(_))).map_or(self.discover.len(), |n| i + n);
+            let at = self.discover[start..i].iter().filter(|d| matches!(d, DItem::Track(_))).count();
+            let shelf = self.discover[start..end].iter().filter_map(|d| if let DItem::Track(t) = d { Some(t.clone()) } else { None }).collect();
+            return Some((shelf, at));
         }
         if let Some(Results::Tracks(t)) = &self.results {
             let i = self.search_sel.selected()?;
@@ -1650,6 +1813,7 @@ impl App {
             // The folder went away or became unreadable since check_dir.
             Msg::Library(Err(e)) => {
                 self.lib_scanning = false;
+                self.lib_error = Some(e.clone());
                 self.status = e;
             }
             Msg::Status(s) => {
@@ -1657,14 +1821,21 @@ impl App {
                     self.status = s;
                 }
             }
-            Msg::LfmToken(r) => match r {
-                Ok(tok) => {
-                    lastfm::open_url(&lastfm::auth_url(&self.cfg.lastfm_api_key, &tok));
-                    self.lfm_token = Some(tok);
-                    self.status = "Approve LastWave in your browser, then press Enter on Last.fm account again".into();
+            // A reply to a connect attempt that was cancelled or started over.
+            Msg::LfmToken(seq, _) | Msg::LfmSession(seq, _) if seq != self.lfm_seq => {}
+            Msg::LfmToken(_, r) => {
+                self.lfm_busy = false;
+                match r {
+                    Ok(tok) => {
+                        // Opened once per token; Enter afterwards only checks for approval.
+                        let url = lastfm::auth_url(&self.cfg.lastfm_api_key, &tok);
+                        lastfm::open_url(&url);
+                        self.lfm_auth = Some((tok, url));
+                        self.status = "Approve LastWave on Last.fm (link in Settings → Notes), then Enter on Last.fm account".into();
+                    }
+                    Err(e) => self.status = e,
                 }
-                Err(e) => self.status = e,
-            },
+            }
             Msg::Art(key, img) => {
                 if let Some(c) = &mut self.covers {
                     c.loaded(key, img);
@@ -1726,18 +1897,29 @@ impl App {
                 }
                 Err(e) => self.status = format!("Could not add to {title}: {e}"),
             },
-            Msg::LfmSession(r) => match r {
-                Ok((sk, name)) => {
-                    self.cfg.lastfm_session = sk;
-                    self.status = format!("Last.fm connected as {name}");
-                    self.cfg.lastfm_user = name;
-                    self.lfm_token = None;
-                    self.lfm_bad_session = false;
-                    self.cfg.save();
-                    self.flush_scrobbles();
+            Msg::LfmSession(_, r) => {
+                self.lfm_busy = false;
+                match r {
+                    Ok((sk, name)) => {
+                        self.cfg.lastfm_session = sk;
+                        self.status = format!("Last.fm connected as {name}");
+                        self.cfg.lastfm_user = name;
+                        self.lfm_auth = None;
+                        self.lfm_bad_session = false;
+                        self.cfg.save();
+                        self.flush_scrobbles();
+                    }
+                    Err(e) if e.token_not_approved() => {
+                        self.status = "Not approved yet — open the link in Settings → Notes, approve, then Enter again (Esc cancels)".into();
+                    }
+                    // The token can't become a session any more: start over.
+                    Err(e) if e.token_dead() => {
+                        self.lfm_auth = None;
+                        self.status = "The Last.fm approval link expired or is invalid — press Enter on Last.fm account to get a new one".into();
+                    }
+                    Err(e) => self.status = format!("{e} — Enter to try again, Esc to cancel"),
                 }
-                Err(e) => self.status = e,
-            },
+            }
         }
     }
 
@@ -1845,9 +2027,12 @@ impl App {
     pub fn on_key(&mut self, k: KeyEvent) {
         let armed = self.confirm_signout;
         self.handle_key(k);
-        // A key that didn't reach the Settings list also cancels a pending sign-out.
+        // Any key but a second Enter on that row cancels a pending sign-out.
         if armed.is_some() && self.confirm_signout == armed {
             self.confirm_signout = None;
+            if self.status.starts_with("Press Enter again") {
+                self.status = "Sign-out cancelled".into();
+            }
         }
         self.keep_sticky();
     }
@@ -1865,54 +2050,280 @@ impl App {
             self.key_picker(k.code);
             return;
         }
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        match k.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char(c @ '1'..='6') => self.view = View::ALL[(c as u8 - b'1') as usize],
-            KeyCode::Tab => self.cycle_view(1),
-            KeyCode::BackTab => self.cycle_view(View::ALL.len() - 1),
-            KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Char('n') => self.next(),
-            KeyCode::Char('p') => self.prev(),
-            KeyCode::Char(',') => self.mpv_cmd(json!(["seek", -10, "relative"])),
-            KeyCode::Char('.') => self.mpv_cmd(json!(["seek", 10, "relative"])),
-            KeyCode::Left if self.view != View::Eq && self.view != View::Settings => {
-                self.mpv_cmd(json!(["seek", -5, "relative"]))
-            }
-            KeyCode::Right if self.view != View::Eq && self.view != View::Settings => {
-                self.mpv_cmd(json!(["seek", 5, "relative"]))
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => self.mpv_cmd(json!(["add", "volume", 5])),
-            KeyCode::Char('-') => self.mpv_cmd(json!(["add", "volume", -5])),
-            KeyCode::Char('/') => {
+        // main.rs quits on Ctrl+C first; never let it act as plain c.
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        if let Some(a) = global_act(k.code).or_else(|| view_act(self.view, k.code)) {
+            self.run(a);
+        }
+    }
+
+    fn run(&mut self, a: Act) {
+        match a {
+            Act::Quit => self.quit = true,
+            Act::Help => self.help = true,
+            Act::ShowView(i) => self.view = View::ALL[i],
+            Act::CycleView(back) => self.cycle_view(if back { View::ALL.len() - 1 } else { 1 }),
+            Act::Search => {
                 self.view = View::Search;
                 self.begin_input(Input::Search, self.query.clone());
             }
-            KeyCode::Char('v') => {
+            Act::Details => {
                 self.cfg.show_details = !self.cfg.show_details;
                 self.cfg.save();
             }
-            KeyCode::Char('R') => {
+            Act::ShowPlaying => match self.cur {
+                Some(c) => {
+                    self.view = View::Queue;
+                    self.queue_sel.select(Some(c));
+                }
+                None => self.status = "Nothing is playing".into(),
+            },
+            Act::SignInYt if ytm::signed_in() => {
+                self.status = format!("Signed in to YouTube Music as {} (sign out in Settings)", self.cfg.yt_user)
+            }
+            Act::SignInYt => self.start_yt_login(),
+            Act::Undo => self.undo_queue(),
+            Act::PlayPause => self.toggle_pause(),
+            Act::Next => self.next(),
+            Act::Prev => self.prev(),
+            Act::Seek(s) => self.mpv_cmd(json!(["seek", s, "relative"])),
+            Act::Volume(d) => self.mpv_cmd(json!(["add", "volume", d])),
+            Act::RadioPlaying => self.radio_from_current(),
+            Act::FlagAi => self.toggle_ai_flag(),
+            Act::Autoplay => {
                 self.cfg.radio = !self.cfg.radio;
                 self.status = format!("Radio autoplay {}", if self.cfg.radio { "on" } else { "off" });
                 self.cfg.save();
                 self.maybe_radio();
             }
-            KeyCode::Char('B') => self.toggle_ai_flag(),
-            KeyCode::Char('l') if !matches!(self.view, View::Eq | View::Settings) => self.toggle_like(),
-            KeyCode::Char('P') => self.open_picker(),
-            KeyCode::Char('w') => self.radio_from_current(),
-            KeyCode::Char('u') => self.undo_queue(),
-            code => match self.view {
-                View::Search => self.key_search(code),
-                View::Queue => self.key_queue(code),
-                View::Library => self.key_library(code),
-                View::Lyrics => {}
-                View::Eq => self.key_eq(code),
-                View::Settings => self.key_settings(code),
+            Act::Activate => self.activate(),
+            Act::Back => self.back(),
+            Act::Refresh => self.refresh(),
+            Act::PlayNext => self.play_next_target(),
+            Act::AddToQueue if self.view == View::Queue && self.highlighted().is_some() => {
+                self.status = "Already in the queue (N moves it to play next)".into()
+            }
+            Act::AddToQueue => {
+                if let Some(t) = self.target_track("add it to the queue") {
+                    self.append(vec![t]);
+                }
+            }
+            Act::AddAll if self.view == View::Queue => self.status = "Already in the queue".into(),
+            Act::AddAll => match self.list_context() {
+                Some((tracks, _)) => self.append(tracks),
+                None => self.status = "No song list here to add".into(),
             },
+            Act::Radio => self.radio_target(),
+            Act::Like => self.toggle_like(),
+            Act::AddToPlaylist => self.open_picker(),
+            Act::Move(d) => self.move_cursor(d),
+            Act::SearchType => {
+                self.kind = self.kind.next();
+                self.run_search();
+            }
+            Act::Remove => {
+                if let Some(i) = self.queue_sel.selected() {
+                    self.remove_from_queue(i);
+                }
+            }
+            Act::Shift(up) => {
+                if let Some(i) = self.queue_sel.selected().filter(|&i| i < self.queue.len()) {
+                    self.move_in_queue(i, up);
+                }
+            }
+            Act::ClearQueue => {
+                self.snapshot_queue();
+                match self.cur.and_then(|c| self.queue.get(c).cloned()) {
+                    Some(t) => {
+                        self.queue = vec![t];
+                        self.cur = Some(0);
+                    }
+                    None => self.queue.clear(),
+                }
+                self.queue_sel.select(self.cur);
+                self.sync_next();
+                self.status = "Queue cleared — u to undo".into();
+            }
+            Act::LibSource(m) => {
+                let m = m.unwrap_or(if self.lib_mode == LibMode::Local { LibMode::Yt } else { LibMode::Local });
+                self.lib_mode = m;
+                if m == LibMode::Yt && self.yt_lists.is_empty() && !self.yt_loading {
+                    self.load_yt_lists();
+                }
+            }
+            // Both work on local files, so they switch to them.
+            Act::Filter => {
+                self.lib_mode = LibMode::Local;
+                self.begin_input(Input::LibFilter, self.lib_filter.clone());
+            }
+            Act::Folder => {
+                self.lib_mode = LibMode::Local;
+                self.begin_input(Input::LibDir, self.cfg.library_dir.clone());
+            }
+            Act::EqBand(d) => self.eq_band = (self.eq_band as isize + d as isize).clamp(0, eq::BANDS.len() as isize - 1) as usize,
+            Act::EqGain(d) => {
+                let g = &mut self.cfg.eq.gains[self.eq_band];
+                *g = (*g + d as f64 * 0.5).clamp(-eq::MAX_GAIN, eq::MAX_GAIN);
+                self.cfg.eq.enabled = true;
+                self.cfg.eq.preset = "Custom".into();
+                self.apply_eq();
+            }
+            Act::EqToggle => {
+                self.cfg.eq.enabled = !self.cfg.eq.enabled;
+                self.apply_eq();
+            }
+            Act::EqPreset(next) => {
+                let n = eq::PRESETS.len();
+                let i = self.cfg.eq.preset_index();
+                self.cfg.eq.apply_preset(if next { (i + 1) % n } else { (i + n - 1) % n });
+                self.apply_eq();
+            }
+            Act::EqReset => {
+                self.cfg.eq.apply_preset(0);
+                self.apply_eq();
+            }
+            Act::Clarity => {
+                self.cfg.eq.clarity = !self.cfg.eq.clarity;
+                self.apply_eq();
+            }
+            Act::ClarityProfile(next) => {
+                let n = eq::CLARITY.len();
+                let i = self.cfg.eq.clarity_preset;
+                self.cfg.eq.clarity_preset = if next { (i + 1) % n } else { (i + n - 1) % n };
+                self.cfg.eq.clarity = true;
+                self.apply_eq();
+            }
+            // Signed-in account rows change only through Enter (twice).
+            Act::Change(back) => {
+                if !self.signed_in_row(self.set_sel) {
+                    self.change_setting(back);
+                }
+            }
+        }
+    }
+
+    /// Enter: play the highlighted song (its list from there on becomes the
+    /// queue), open the highlighted album/playlist/artist, or change the
+    /// highlighted setting.
+    fn activate(&mut self) {
+        match self.view {
+            View::Settings => self.settings_enter(),
+            View::Search | View::Queue | View::Library => {
+                if let Some((tracks, i)) = self.list_context() {
+                    if self.view == View::Queue {
+                        self.play_index(i);
+                    } else {
+                        self.play_list(tracks, i);
+                    }
+                } else if let Some(Highlight::Collection(c)) = self.highlighted() {
+                    self.open_collection(c, self.view == View::Library);
+                }
+            }
+            View::Lyrics | View::Eq => {}
+        }
+    }
+
+    /// Esc / Backspace: leave an opened page, else clear the search or filter.
+    fn back(&mut self) {
+        match self.view {
+            View::Search if self.browse.is_some() => self.browse = None,
+            View::Search if !self.query.is_empty() => {
+                self.query.clear();
+                self.results = None;
+            }
+            View::Library if self.lib_mode == LibMode::Yt => self.yt_open = None,
+            View::Library => self.set_lib_filter(String::new()),
+            View::Settings if self.lfm_auth.is_some() || self.lfm_busy => self.lfm_cancel(),
+            _ => {}
+        }
+    }
+
+    /// S: load what the view shows again.
+    fn refresh(&mut self) {
+        match self.view {
+            View::Search => match self.browse.as_ref().map(|(c, _)| c.clone()) {
+                Some(c) => self.open_collection(c, false),
+                None if self.discover_mode() => self.load_home(),
+                None => self.run_search(),
+            },
+            View::Library if self.lib_mode == LibMode::Yt => match self.yt_open.as_ref().map(|(c, _)| c.clone()) {
+                Some(c) => self.open_collection(c, true),
+                None => self.load_yt_lists(),
+            },
+            View::Library => self.rescan(),
+            _ => {}
+        }
+    }
+
+    fn move_cursor(&mut self, d: isize) {
+        if self.view == View::Settings {
+            self.set_sel = (self.set_sel as isize).saturating_add(d).clamp(0, SETTINGS.len() as isize - 1) as usize;
+            return;
+        }
+        let discover = self.view == View::Search && self.discover_mode();
+        let before = self.discover_sel.selected().unwrap_or(0);
+        if let Some((state, len)) = self.active_list() {
+            nav(state, len, d);
+        }
+        if discover {
+            self.skip_headers(before);
+        }
+    }
+
+    /// The highlighted song and the list it is in, for "play from here" / "add all".
+    fn list_context(&self) -> Option<(Vec<Track>, usize)> {
+        match self.view {
+            View::Search => self.selected_search_track(),
+            View::Queue => self.queue_sel.selected().filter(|&i| i < self.queue.len()).map(|i| (self.queue.clone(), i)),
+            View::Library if self.lib_mode == LibMode::Yt => {
+                let (_, t) = self.yt_open.as_ref()?;
+                self.yt_open_sel.selected().filter(|&i| i < t.len()).map(|i| (t.clone(), i))
+            }
+            View::Library => {
+                let i = self.lib_sel.selected().filter(|&i| i < self.lib_vis.len())?;
+                Some((self.lib_vis.iter().map(|&j| self.library[j].clone()).collect(), i))
+            }
+            _ => None,
+        }
+    }
+
+    /// N: in the Queue the highlighted song moves up to play next; elsewhere it is inserted there.
+    fn play_next_target(&mut self) {
+        if self.view == View::Queue {
+            if let Some(i) = self.queue_sel.selected().filter(|&i| i < self.queue.len()) {
+                match self.cur {
+                    Some(c) if c == i => self.status = "That song is playing now".into(),
+                    Some(c) => {
+                        let t = self.queue.remove(i);
+                        let c = if i < c { c - 1 } else { c };
+                        self.cur = Some(c);
+                        self.queue.insert(c + 1, t);
+                        self.queue_sel.select(Some(c + 1));
+                        self.sync_next();
+                        self.status = "Moved to play next".into();
+                    }
+                    None => self.status = "Nothing is playing".into(),
+                }
+                return;
+            }
+        }
+        if let Some(t) = self.target_track("play it next") {
+            self.play_next(vec![t]);
+        }
+    }
+
+    /// r: radio from the highlighted song (from the playing one without restarting it).
+    fn radio_target(&mut self) {
+        let Some(t) = self.target_track("start a radio from it") else { return };
+        if t.video_id().is_none() {
+            self.status = "Radio needs a YouTube song".into();
+        } else if self.current().is_some_and(|c| c.source == t.source) {
+            self.radio_from_current();
+        } else {
+            self.start_radio(t);
         }
     }
 
@@ -1958,13 +2369,17 @@ impl App {
                         self.cfg.save();
                         self.rescan();
                     }
-                    Input::LfmKey => {
-                        self.cfg.lastfm_api_key = v;
+                    // A pending approval belongs to the old key; start over with the new one.
+                    Input::LfmKey | Input::LfmSecret => {
+                        if target == Input::LfmKey {
+                            self.cfg.lastfm_api_key = v;
+                        } else {
+                            self.cfg.lastfm_api_secret = v;
+                        }
                         self.cfg.save();
-                    }
-                    Input::LfmSecret => {
-                        self.cfg.lastfm_api_secret = v;
-                        self.cfg.save();
+                        if self.lfm_auth.is_some() || self.lfm_busy {
+                            self.lfm_cancel();
+                        }
                     }
                     // Nothing typed: read the system clipboard instead.
                     Input::YtCookies => self.submit_yt_cookies(Some(v).filter(|v| !v.is_empty())),
@@ -1989,273 +2404,6 @@ impl App {
         }
     }
 
-    fn key_search(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Char('i') => self.begin_input(Input::Search, self.query.clone()),
-            KeyCode::Char('f') => {
-                self.kind = self.kind.next();
-                self.run_search();
-            }
-            KeyCode::Esc | KeyCode::Backspace if self.browse.is_some() => self.browse = None,
-            KeyCode::Esc if !self.query.is_empty() => {
-                self.query.clear();
-                self.results = None;
-            }
-            KeyCode::Char('S') if self.discover_mode() => self.load_home(),
-            KeyCode::Enter => {
-                if let Some((tracks, i)) = self.selected_search_track() {
-                    if self.browse.is_some() {
-                        self.play_list(tracks, i);
-                    } else {
-                        self.play_now(tracks[i].clone());
-                    }
-                } else if let Some(c) = self.selected_search_collection() {
-                    self.open_collection(c, false);
-                }
-            }
-            KeyCode::Char('a') => {
-                if let Some((tracks, i)) = self.selected_search_track() {
-                    self.append(vec![tracks[i].clone()]);
-                }
-            }
-            KeyCode::Char('N') => {
-                if let Some((tracks, i)) = self.selected_search_track() {
-                    self.play_next(vec![tracks[i].clone()]);
-                }
-            }
-            KeyCode::Char('A') => {
-                if let Some((_, t)) = &self.browse {
-                    let t = t.clone();
-                    self.append(t);
-                } else if let (false, Some(Results::Tracks(t))) = (self.discover_mode(), &self.results) {
-                    let t = t.clone();
-                    self.append(t);
-                }
-            }
-            KeyCode::Char('r') => {
-                if let Some((tracks, i)) = self.selected_search_track() {
-                    self.start_radio(tracks[i].clone());
-                }
-            }
-            code => {
-                if let Some((_, t)) = &self.browse {
-                    let len = t.len();
-                    list_nav(&mut self.browse_sel, len, code);
-                } else if self.discover_mode() {
-                    let before = self.discover_sel.selected().unwrap_or(0);
-                    if list_nav(&mut self.discover_sel, self.discover.len(), code) {
-                        self.skip_headers(before);
-                    }
-                } else {
-                    let len = match &self.results {
-                        Some(Results::Tracks(t)) => t.len(),
-                        Some(Results::Collections(c)) => c.len(),
-                        None => 0,
-                    };
-                    list_nav(&mut self.search_sel, len, code);
-                }
-            }
-        }
-    }
-
-    fn key_queue(&mut self, code: KeyCode) {
-        let sel = self.queue_sel.selected();
-        match code {
-            KeyCode::Enter => {
-                if let Some(i) = sel {
-                    self.play_index(i);
-                }
-            }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if let Some(i) = sel {
-                    self.remove_from_queue(i);
-                }
-            }
-            KeyCode::Char('N') => {
-                if let (Some(i), Some(c)) = (sel, self.cur) {
-                    if i != c {
-                        let t = self.queue.remove(i);
-                        let c = if i < c { c - 1 } else { c };
-                        self.cur = Some(c);
-                        self.queue.insert(c + 1, t);
-                        self.queue_sel.select(Some(c + 1));
-                        self.sync_next();
-                        self.status = "Moved to play next".into();
-                    }
-                }
-            }
-            KeyCode::Char('K') => {
-                if let Some(i) = sel {
-                    self.move_in_queue(i, true);
-                }
-            }
-            KeyCode::Char('J') => {
-                if let Some(i) = sel {
-                    self.move_in_queue(i, false);
-                }
-            }
-            KeyCode::Char('c') => self.queue_sel.select(self.cur),
-            KeyCode::Char('X') => {
-                self.snapshot_queue();
-                match self.cur.and_then(|c| self.queue.get(c).cloned()) {
-                    Some(t) => {
-                        self.queue = vec![t];
-                        self.cur = Some(0);
-                    }
-                    None => self.queue.clear(),
-                }
-                self.queue_sel.select(self.cur);
-                self.sync_next();
-                self.status = "Queue cleared — u to undo".into();
-            }
-            code => {
-                list_nav(&mut self.queue_sel, self.queue.len(), code);
-            }
-        }
-    }
-
-    fn key_library(&mut self, code: KeyCode) {
-        let mode = match code {
-            KeyCode::Char('y') => Some(if self.lib_mode == LibMode::Local { LibMode::Yt } else { LibMode::Local }),
-            KeyCode::F(11) => Some(LibMode::Local),
-            KeyCode::F(12) => Some(LibMode::Yt),
-            _ => None,
-        };
-        if let Some(m) = mode {
-            self.lib_mode = m;
-            if m == LibMode::Yt && self.yt_lists.is_empty() && !self.yt_loading {
-                self.load_yt_lists();
-            }
-            return;
-        }
-        if self.lib_mode == LibMode::Yt {
-            self.key_library_yt(code);
-            return;
-        }
-        let n = self.lib_vis.len();
-        let sel = self.lib_sel.selected().filter(|&i| i < n);
-        let vis_tracks = |a: &Self| a.lib_vis.iter().map(|&j| a.library[j].clone()).collect::<Vec<_>>();
-        match code {
-            KeyCode::Char('f') | KeyCode::Char('i') => self.begin_input(Input::LibFilter, self.lib_filter.clone()),
-            KeyCode::Esc => self.set_lib_filter(String::new()),
-            KeyCode::Char('o') => self.begin_input(Input::LibDir, self.cfg.library_dir.clone()),
-            KeyCode::Char('S') => self.rescan(),
-            KeyCode::Enter => {
-                if let Some(i) = sel {
-                    let tracks = vis_tracks(self);
-                    self.play_list(tracks, i);
-                }
-            }
-            KeyCode::Char('a') => {
-                if let Some(i) = sel {
-                    self.append(vec![self.library[self.lib_vis[i]].clone()]);
-                }
-            }
-            KeyCode::Char('N') => {
-                if let Some(i) = sel {
-                    self.play_next(vec![self.library[self.lib_vis[i]].clone()]);
-                }
-            }
-            KeyCode::Char('A') => {
-                let tracks = vis_tracks(self);
-                self.append(tracks);
-            }
-            code => {
-                list_nav(&mut self.lib_sel, n, code);
-            }
-        }
-    }
-
-    fn key_library_yt(&mut self, code: KeyCode) {
-        let open_sel = self.yt_open.as_ref().and_then(|(_, t)| self.yt_open_sel.selected().filter(|&i| i < t.len()));
-        let open_track = |app: &Self| open_sel.and_then(|i| app.yt_open.as_ref().map(|(_, t)| t[i].clone()));
-        match code {
-            KeyCode::Esc | KeyCode::Backspace if self.yt_open.is_some() => self.yt_open = None,
-            KeyCode::Char('S') => self.load_yt_lists(),
-            KeyCode::Char('L') if !ytm::signed_in() => self.start_yt_login(),
-            KeyCode::Enter => {
-                if let (Some((_, t)), Some(i)) = (&self.yt_open, open_sel) {
-                    let t = t.clone();
-                    self.play_list(t, i);
-                } else if self.yt_open.is_none() {
-                    if let Some(c) = self.yt_lists_sel.selected().and_then(|i| self.yt_lists.get(i)).cloned() {
-                        self.open_collection(c, true);
-                    }
-                }
-            }
-            KeyCode::Char('a') => {
-                if let Some(t) = open_track(self) {
-                    self.append(vec![t]);
-                }
-            }
-            KeyCode::Char('N') => {
-                if let Some(t) = open_track(self) {
-                    self.play_next(vec![t]);
-                }
-            }
-            KeyCode::Char('r') => {
-                if let Some(t) = open_track(self) {
-                    self.start_radio(t);
-                }
-            }
-            KeyCode::Char('A') => {
-                if let Some((_, t)) = &self.yt_open {
-                    let t = t.clone();
-                    self.append(t);
-                }
-            }
-            code => {
-                if let Some((_, t)) = &self.yt_open {
-                    let len = t.len();
-                    list_nav(&mut self.yt_open_sel, len, code);
-                } else {
-                    list_nav(&mut self.yt_lists_sel, self.yt_lists.len(), code);
-                }
-            }
-        }
-    }
-
-    fn key_eq(&mut self, code: KeyCode) {
-        let b = self.eq_band;
-        match code {
-            KeyCode::Left | KeyCode::Char('h') => self.eq_band = b.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => self.eq_band = (b + 1).min(eq::BANDS.len() - 1),
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
-                let d = if matches!(code, KeyCode::Up | KeyCode::Char('k')) { 0.5 } else { -0.5 };
-                let g = &mut self.cfg.eq.gains[b];
-                *g = (*g + d).clamp(-eq::MAX_GAIN, eq::MAX_GAIN);
-                self.cfg.eq.enabled = true;
-                self.cfg.eq.preset = "Custom".into();
-                self.apply_eq();
-            }
-            KeyCode::Char('e') => {
-                self.cfg.eq.enabled = !self.cfg.eq.enabled;
-                self.apply_eq();
-            }
-            KeyCode::Char(']') | KeyCode::Char('[') => {
-                let n = eq::PRESETS.len();
-                let i = self.cfg.eq.preset_index();
-                let next = if code == KeyCode::Char(']') { (i + 1) % n } else { (i + n - 1) % n };
-                self.cfg.eq.apply_preset(next);
-                self.apply_eq();
-            }
-            KeyCode::Char('c') => {
-                self.cfg.eq.clarity = !self.cfg.eq.clarity;
-                self.apply_eq();
-            }
-            KeyCode::Char('C') => {
-                self.cfg.eq.clarity_preset = (self.cfg.eq.clarity_preset + 1) % eq::CLARITY.len();
-                self.cfg.eq.clarity = true;
-                self.apply_eq();
-            }
-            KeyCode::Char('z') => {
-                self.cfg.eq.apply_preset(0);
-                self.apply_eq();
-            }
-            _ => {}
-        }
-    }
-
     pub fn setting_value(&self, i: usize) -> String {
         let on = |b: bool| if b { "on" } else { "off" }.to_string();
         match i {
@@ -2274,6 +2422,7 @@ impl App {
                 .map(|(_, l)| l.to_string())
                 .unwrap_or_else(|| self.cfg.ytdl_format.clone()),
             5 => on(self.cfg.radio),
+            6 if self.cfg.library_dir.is_empty() => "(not set — Enter to choose your music folder)".into(),
             6 => self.cfg.library_dir.clone(),
             7 => mask(&self.cfg.lastfm_api_key),
             8 => mask(&self.cfg.lastfm_api_secret),
@@ -2304,8 +2453,10 @@ impl App {
             9 => {
                 if !self.cfg.lastfm_user.is_empty() && self.lfm_ready() {
                     format!("connected as {} (Enter twice to disconnect)", self.cfg.lastfm_user)
-                } else if self.lfm_token.is_some() {
-                    "waiting for browser approval — press Enter".into()
+                } else if self.lfm_busy {
+                    "contacting Last.fm…".into()
+                } else if self.lfm_auth.is_some() {
+                    "waiting for approval (Enter checks, Esc cancels)".into()
                 } else {
                     "not connected (Enter to connect)".into()
                 }
@@ -2314,36 +2465,22 @@ impl App {
         }
     }
 
-    fn key_settings(&mut self, code: KeyCode) {
-        let back = matches!(code, KeyCode::Left | KeyCode::Char('h'));
-        // Any other key cancels a sign-out waiting for its second Enter.
+    /// Enter in Settings. Signed-in account rows sign out on a second Enter.
+    fn settings_enter(&mut self) {
         let armed = self.confirm_signout.take();
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => self.set_sel = self.set_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.set_sel = (self.set_sel + 1).min(SETTINGS.len() - 1),
-            // Account rows: only Enter signs out, and only when pressed twice.
-            KeyCode::Enter if self.signed_in_row(self.set_sel) => {
-                let row = self.set_sel;
-                if armed == Some(row) {
-                    if row == SET_YT_ACCOUNT {
-                        self.yt_sign_out();
-                    } else {
-                        self.lfm_disconnect();
-                    }
-                } else {
-                    self.confirm_signout = Some(row);
-                    let what = if row == SET_YT_ACCOUNT { "sign out of YouTube Music" } else { "disconnect Last.fm" };
-                    self.status = format!("Press Enter again to {what} (any other key cancels)");
-                }
+        let row = self.set_sel;
+        if !self.signed_in_row(row) {
+            self.change_setting(false);
+        } else if armed == Some(row) {
+            if row == SET_YT_ACCOUNT {
+                self.yt_sign_out();
+            } else {
+                self.lfm_disconnect();
             }
-            KeyCode::Right | KeyCode::Left | KeyCode::Char('l') | KeyCode::Char('h') if self.signed_in_row(self.set_sel) => {}
-            KeyCode::Enter | KeyCode::Right | KeyCode::Left | KeyCode::Char('l') | KeyCode::Char('h') => {
-                self.change_setting(back)
-            }
-            _ => {}
-        }
-        if armed.is_some() && self.confirm_signout.is_none() && self.status.starts_with("Press Enter again") {
-            self.status = "Sign-out cancelled".into();
+        } else {
+            self.confirm_signout = Some(row);
+            let what = if row == SET_YT_ACCOUNT { "sign out of YouTube Music" } else { "disconnect Last.fm" };
+            self.status = format!("Press Enter again to {what} (any other key cancels)");
         }
     }
 
@@ -2454,15 +2591,35 @@ impl App {
     }
 
     fn lastfm_step(&mut self) {
+        if self.lfm_busy {
+            self.status = "Still waiting for Last.fm… (Esc cancels)".into();
+            return;
+        }
         if self.cfg.lastfm_api_key.is_empty() || self.cfg.lastfm_api_secret.is_empty() {
             self.status = "Enter a Last.fm API key + secret first (last.fm/api/account/create)".into();
             return;
         }
-        let (k, s) = (self.cfg.lastfm_api_key.clone(), self.cfg.lastfm_api_secret.clone());
-        match self.lfm_token.clone() {
-            None => self.spawn(move || Msg::LfmToken(lastfm::get_token(&k, &s))),
-            Some(tok) => self.spawn(move || Msg::LfmSession(lastfm::get_session(&k, &s, &tok))),
+        let (k, s, seq) = (self.cfg.lastfm_api_key.clone(), self.cfg.lastfm_api_secret.clone(), self.lfm_seq);
+        self.lfm_busy = true;
+        match self.lfm_auth.clone() {
+            None => {
+                self.status = "Asking Last.fm for an approval link…".into();
+                self.spawn(move || Msg::LfmToken(seq, lastfm::get_token(&k, &s)));
+            }
+            // The browser was opened when the token came; now just ask whether it was approved.
+            Some((tok, _)) => {
+                self.status = "Checking with Last.fm…".into();
+                self.spawn(move || Msg::LfmSession(seq, lastfm::get_session(&k, &s, &tok)));
+            }
         }
+    }
+
+    /// Drop a Last.fm connect in progress; replies still on their way are ignored.
+    fn lfm_cancel(&mut self) {
+        self.lfm_seq += 1;
+        self.lfm_busy = false;
+        self.lfm_auth = None;
+        self.status = "Last.fm connect cancelled".into();
     }
 
     pub fn highlighted(&self) -> Option<Highlight> {
@@ -2516,10 +2673,14 @@ impl App {
         let pos = Position::new(m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.input.is_some() || self.help || self.picker.is_some() {
-                    if self.input.take().is_none() {
-                        self.picker = None;
-                    }
+                // A click never throws typed (or pasted) text away: only Enter
+                // or Esc end a text field.
+                if self.input.is_some() {
+                    self.status = "Still typing — Enter to confirm, Esc to cancel".into();
+                    return;
+                }
+                if self.help || self.picker.is_some() {
+                    self.picker = None;
                     self.help = false;
                     return;
                 }
@@ -2548,9 +2709,7 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 if self.list_area.is_some_and(|a| a.contains(pos)) {
-                    if let Some((state, len)) = self.active_list() {
-                        nav(state, len, if up { -3 } else { 3 });
-                    }
+                    self.move_cursor(if up { -3 } else { 3 });
                 } else if m.row + 7 >= self.term_height {
                     // Wheel over the player bar changes volume.
                     self.mpv_cmd(json!(["add", "volume", if up { 5 } else { -5 }]));
@@ -2657,5 +2816,160 @@ mod tests {
         // Nothing playing.
         let (q, c) = restore_queue(old.clone(), Some(1), None);
         assert_eq!((ids(&q), c), (ids(&old), None));
+    }
+
+    /// Every key the app could see: printable ASCII and the named keys.
+    fn all_keys() -> Vec<KeyCode> {
+        let mut keys: Vec<KeyCode> = (' '..='~').map(KeyCode::Char).collect();
+        keys.extend([
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Delete,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ]);
+        keys.extend((1..=12).map(KeyCode::F));
+        keys
+    }
+
+    #[test]
+    fn keymap_globals_not_shadowed() {
+        // Global keys are looked up first, so a view binding for one would be
+        // dead code and a second meaning for the key: there must be none.
+        for view in View::ALL {
+            for k in all_keys() {
+                if let (Some(g), Some(v)) = (global_act(k), view_act(view, k)) {
+                    panic!("{k:?} is global ({g:?}) but {view:?} binds it to {v:?}");
+                }
+            }
+        }
+        // Keys that used to change meaning by view now have one.
+        for k in ['l', 'c', 'f', 'S', 'n', 'p'] {
+            let k = KeyCode::Char(k);
+            let acts: HashSet<String> = View::ALL.iter().filter_map(|&v| global_act(k).or(view_act(v, k))).map(|a| format!("{a:?}")).collect();
+            assert!(acts.len() <= 1, "{k:?} means {acts:?}");
+        }
+    }
+
+    #[test]
+    fn keymap_keys_are_in_help() {
+        let help = crate::ui::HELP;
+        let key_tokens: HashSet<&str> = help.iter().flat_map(|(_, rows)| rows.iter().flat_map(|(k, _)| k.split_whitespace())).collect();
+        let text: String = help.iter().flat_map(|(_, rows)| rows.iter().map(|(k, d)| format!("{k} {d} "))).collect();
+        // Aliases left out of the help to keep it on one 80x24 screen; listed in KEYS.md.
+        let aliases = [KeyCode::Char('='), KeyCode::Home, KeyCode::End, KeyCode::F(11), KeyCode::F(12)];
+        for k in all_keys() {
+            if aliases.contains(&k) || (global_act(k).is_none() && View::ALL.iter().all(|&v| view_act(v, k).is_none())) {
+                continue;
+            }
+            let documented = match k {
+                KeyCode::Char('1'..='6') => key_tokens.contains("1-6"),
+                KeyCode::Char(' ') => key_tokens.contains("Space"),
+                KeyCode::Char(c) => key_tokens.contains(c.to_string().as_str()),
+                KeyCode::Up | KeyCode::Down => text.contains("↑↓"),
+                KeyCode::Left => text.contains('←'),
+                KeyCode::Right => text.contains('→'),
+                KeyCode::Backspace => text.contains('⌫'),
+                KeyCode::BackTab => text.contains("⇧Tab"),
+                KeyCode::Delete => key_tokens.contains("Del"),
+                KeyCode::PageUp => key_tokens.contains("PgUp"),
+                KeyCode::PageDown => key_tokens.contains("PgDn"),
+                k => key_tokens.contains(k.to_string().as_str()),
+            };
+            assert!(documented, "{k:?} is bound but missing from the help screen");
+        }
+    }
+
+    #[test]
+    fn song_keys_act_on_the_highlighted_row() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.queue = vec![t("a"), t("b")];
+        app.cur = Some(0);
+        app.view = View::Queue;
+        app.queue_sel.select(Some(1));
+        assert!(matches!(app.target(), Some(Highlight::Track(x)) if x.title == "b"));
+        // No list in the view: the playing song.
+        app.view = View::Lyrics;
+        assert!(matches!(app.target(), Some(Highlight::Track(x)) if x.title == "a"));
+        // An album highlighted: song keys say so instead of using the playing song.
+        app.view = View::Search;
+        app.query = "x".into();
+        let album = Collection { browse_id: "MPREb_x".into(), title: "Album".into(), subtitle: String::new(), art: String::new() };
+        app.results = Some(Results::Collections(vec![album]));
+        app.search_sel.select(Some(0));
+        assert!(app.target_track("like it").is_none());
+        assert!(app.status.contains("Open Album"), "{}", app.status);
+    }
+
+    #[test]
+    fn discover_enter_plays_the_shelf() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.view = View::Search;
+        app.query.clear();
+        app.browse = None;
+        app.discover = vec![
+            DItem::Header("one".into()),
+            DItem::Track(t("a")),
+            DItem::Header("two".into()),
+            DItem::Track(t("b")),
+            DItem::Track(t("c")),
+        ];
+        app.discover_sel.select(Some(4));
+        let (tracks, i) = app.list_context().unwrap();
+        assert_eq!((ids(&tracks), i), (vec!["b".to_string(), "c".to_string()], 1));
+    }
+
+    #[test]
+    fn click_keeps_typed_text() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.begin_input(Input::YtCookies, String::new());
+        app.on_paste("SID=abc; HSID=def".into());
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 3, row: 3, modifiers: KeyModifiers::NONE };
+        app.on_mouse(click);
+        assert_eq!(app.input, Some(Input::YtCookies));
+        assert_eq!(app.input_buf, "SID=abc; HSID=def");
+    }
+
+    #[test]
+    fn lastfm_connect_flow() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        let err = |code| Err(lastfm::LfmError { code, msg: format!("Last.fm: error {code}") });
+        app.lfm_auth = Some(("tok".into(), "https://www.last.fm/api/auth/?api_key=k&token=tok".into()));
+        // Not approved yet: keep the token, Enter checks again.
+        app.lfm_busy = true;
+        app.handle_msg(Msg::LfmSession(app.lfm_seq, err(14)));
+        assert!(app.lfm_auth.is_some() && !app.lfm_busy);
+        // Expired or invalid: start over instead of asking again forever.
+        for code in [15, 4] {
+            app.lfm_auth = Some(("tok".into(), "url".into()));
+            app.handle_msg(Msg::LfmSession(app.lfm_seq, err(code)));
+            assert!(app.lfm_auth.is_none(), "error {code}");
+        }
+        // While a request is out, Enter doesn't send another (or open another tab).
+        app.cfg.lastfm_api_key = "k".into();
+        app.cfg.lastfm_api_secret = "s".into();
+        app.lfm_busy = true;
+        app.lastfm_step();
+        assert!(app.status.starts_with("Still waiting"));
+        // Esc cancels; a reply to the cancelled attempt is ignored.
+        let seq = app.lfm_seq;
+        app.view = View::Settings;
+        app.run(Act::Back);
+        assert!(!app.lfm_busy);
+        app.handle_msg(Msg::LfmToken(seq, Ok("late".into())));
+        assert!(app.lfm_auth.is_none());
     }
 }

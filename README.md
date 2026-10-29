@@ -86,8 +86,9 @@ or Sixel graphics protocol (WezTerm, Kitty, iTerm2, Windows Terminal 1.22+); oth
 
 ## Keys
 
-`?` shows the key list. Common keys: `1-6` switch views, `/` search from anywhere (an empty search shows Discover), `Enter` play,
-`a` add to queue, `l` like, `P` add to playlist, `Space` play/pause, `n`/`p` next/previous, `←`/`→` seek, `+`/`-` volume, `q` quit.
+`?` shows the key list; [KEYS.md](KEYS.md) has all of them. Common keys: `1-6` switch views, `/` search from anywhere (an empty search shows Discover),
+`Enter` play from here / open, `a` add to queue, `l` like, `P` add to playlist (these act on the highlighted song, else the playing one),
+`Space` play/pause, `n`/`p` next/previous, `←`/`→` seek, `+`/`-` volume, `u` undo, `q` quit.
 
 ## Files
 

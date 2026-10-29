@@ -34,6 +34,17 @@ impl LfmError {
         self.code == 9
     }
 
+    /// Error 14: the auth token exists but the user hasn't approved it (yet).
+    pub fn token_not_approved(&self) -> bool {
+        self.code == 14
+    }
+
+    /// Errors 4 (invalid token) and 15 (expired token): asking again with the
+    /// same token can never work; the connect flow has to start over.
+    pub fn token_dead(&self) -> bool {
+        matches!(self.code, 4 | 15)
+    }
+
     /// Worth sending again later: network trouble or a temporary Last.fm outage.
     pub fn retryable(&self) -> bool {
         matches!(self.code, 0 | 8 | 9 | 11 | 16 | 29)
@@ -94,8 +105,8 @@ pub fn auth_url(key: &str, token: &str) -> String {
 }
 
 /// Returns (session key, user name).
-pub fn get_session(key: &str, secret: &str, token: &str) -> Result<(String, String), String> {
-    let v = call(
+pub fn get_session(key: &str, secret: &str, token: &str) -> Result<(String, String), LfmError> {
+    let v = call_coded(
         vec![("method", "auth.getSession".into()), ("api_key", key.into()), ("token", token.into())],
         secret,
         false,
@@ -103,7 +114,7 @@ pub fn get_session(key: &str, secret: &str, token: &str) -> Result<(String, Stri
     let s = &v["session"];
     match (s["key"].as_str(), s["name"].as_str()) {
         (Some(k), Some(n)) => Ok((k.into(), n.into())),
-        _ => Err("authorise LastWave in the browser first, then press Enter again".into()),
+        _ => Err(LfmError { code: -1, msg: "Last.fm sent no session".into() }),
     }
 }
 
@@ -194,5 +205,8 @@ mod tests {
         assert!(e(9).bad_session() && e(9).retryable());
         assert!(e(0).retryable() && e(16).retryable() && e(29).retryable());
         assert!(!e(6).retryable() && !e(13).retryable());
+        // Connect flow: 14 waits for approval; 4 and 15 start over.
+        assert!(e(14).token_not_approved() && !e(14).token_dead());
+        assert!(e(4).token_dead() && e(15).token_dead() && !e(0).token_dead());
     }
 }
