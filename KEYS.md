@@ -4,7 +4,7 @@ Every key has one meaning. Keys in the first three tables work in every view; th
 view tables only list keys that the other views don't use. While a text field has focus,
 keys type text (see "Typing"); in the help and playlist pop-ups, `Esc` closes.
 
-In code: `global_act` and `view_act` in `src/app.rs`. The `keymap_*` tests check that no
+In code: `global_act` and `view_act` in `src/app/keys.rs`. The `keymap_*` tests check that no
 view rebinds a global key and that the help screen (`?`) lists every key.
 
 ## Player (always the playing song)
@@ -43,7 +43,7 @@ the playing song.
 
 | Key | Action |
 |---|---|
-| `Enter` | Song: play it, with its list from there on as the queue (Queue: jump to it; Discover: its shelf). Album / playlist / artist: open it. Settings: change the setting |
+| `Enter` | Song in Search results or Discover: play it now, inserted after the playing song (the rest of the queue stays). Song on an album / playlist page or in the Library: play it, with its list from there on as the queue (`u` undoes). Queue: jump to it. Album / playlist / artist: open it. Settings: change the setting |
 | `N` | Play next (Queue: move the highlighted song up to play next) |
 | `a` | Add to the end of the queue |
 | `A` | Add the whole list to the queue |
@@ -97,7 +97,7 @@ the playing song.
 
 | Key | Before | Now |
 |---|---|---|
-| `Enter` | Search results and Discover: insert the song after the playing one. Library and album pages: play from here | Every song list: play from here (the list becomes the queue, `u` undoes). Discover: the song's shelf |
+| `Enter` | Search results and Discover: insert the song after the playing one. Library and album pages: play from here | Unchanged: Search results and Discover insert the song after the playing one and play it; album / playlist pages and the Library play from here (the list becomes the queue, `u` undoes) |
 | `l`, `P`, `a`, `N`, `r` | `l`/`P` used the playing song when an album was highlighted; `r` only in Search and YouTube Music playlists; `a`/`N` did nothing without a highlighted song | Highlighted row, else the playing song; an album highlight says to open it. `r` works in every view, and on the playing song it doesn't restart it |
 | `l` | Like; in Equalizer: next band; in Settings: change | Like everywhere |
 | `h` | Equalizer: previous band; Settings: change | Unbound (use `←`) |

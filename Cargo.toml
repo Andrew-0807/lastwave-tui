@@ -22,6 +22,10 @@ base64 = "0.22"
 # Job object so mpv dies with us even if the console window is closed.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
+[features]
+# Developer commands (--search, --discover, --selftest, --art-debug).
+dev = []
+
 [profile.release]
 opt-level = 3
 lto = true

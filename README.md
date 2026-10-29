@@ -97,4 +97,4 @@ The config and saved queue are in `%APPDATA%\lastwave-tui\` (`~/.config/lastwave
 
 Cover art: real images (Kitty, iTerm2, Sixel) where the terminal supports them. Inside herdr the default is **kitty+text**: covers are drawn with sextant block characters, with a Kitty image placed on top. herdr forwards that image only to Kitty-capable clients (WezTerm), so they show the full-resolution cover while others (Rio) show the text version. Change it in Settings → Cover images.
 
-`lastwave-tui --discover` prints the Discover shelves. `lastwave-tui --selftest <album>` runs a headless check of search, album browsing, lyrics and mpv playback.
+Developer commands are built only with `cargo build --features dev` (code in `src/dev.rs`): `lastwave-tui --discover` prints the Discover shelves, `--search <query>` lists song results, `--selftest <album>` runs a headless check of search, album browsing, lyrics and mpv playback, and `--art-debug [log]` records how the terminal answers the image queries.

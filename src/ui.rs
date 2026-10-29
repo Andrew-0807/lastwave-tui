@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, DItem, Highlight, Input, LibMode, View, SETTINGS},
+    app::{App, DItem, Highlight, Input, LibMode, SettingRow, View, SETTINGS},
     art, eq,
     model::{fmt_time, Track},
     ytm::{self, Collection, Results},
@@ -524,7 +524,7 @@ fn draw_search(f: &mut Frame, area: Rect, app: &mut App) {
     let mut st = std::mem::take(&mut app.search_sel);
     match &app.results {
         Some(Results::Tracks(t)) => {
-            let b = block(format!(" Songs{busy}  (Enter play from here, N play next, a queue, r radio, A queue all, l like, P +playlist) "));
+            let b = block(format!(" Songs{busy}  (Enter play, N play next, a queue, r radio, A queue all, l like, P +playlist) "));
             render_list(f, list, b, &mut st, t.len(), |i| track_item(app, &t[i], is_playing(app, &t[i]), &cols));
         }
         Some(Results::Collections(cs)) => {
@@ -813,21 +813,23 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let [list, info] = Layout::vertical([Constraint::Length(SETTINGS.len() as u16 + 2), Constraint::Min(notes_h)]).areas(area);
     let name_w = if list.width >= 60 { 26 } else { 20 };
     let row = |i: usize| {
-        let name = SETTINGS[i];
-        let editing = match (i, app.input) {
-            (6, Some(Input::LibDir)) | (7, Some(Input::LfmKey)) | (8, Some(Input::LfmSecret)) => Some(format!("{}▏", app.input_buf)),
-            (10, Some(Input::YtCookies)) => Some(if app.input_buf.is_empty() {
+        let setting = SETTINGS[i];
+        let editing = match (setting, app.input) {
+            (SettingRow::LibraryDir, Some(Input::LibDir)) | (SettingRow::LfmKey, Some(Input::LfmKey)) | (SettingRow::LfmSecret, Some(Input::LfmSecret)) => {
+                Some(format!("{}▏", app.input_buf))
+            }
+            (SettingRow::YtAccount, Some(Input::YtCookies)) => Some(if app.input_buf.is_empty() {
                 "Enter = sign in with clipboard · or paste first · Esc cancel▏".into()
             } else {
                 format!("{} characters pasted — Enter to sign in▏", app.input_buf.chars().count())
             }),
             _ => None,
         };
-        let value = editing.unwrap_or_else(|| app.setting_value(i));
+        let value = editing.unwrap_or_else(|| app.setting_value(setting));
         let marker = if i == app.set_sel { Span::styled("›", accent().bold()) } else { Span::raw(" ") };
         ListItem::new(Line::from(vec![
             marker,
-            Span::raw(fit(name, name_w)),
+            Span::raw(fit(setting.label(), name_w)),
             Span::styled(format!(" {value}"), accent()),
         ]))
     };
@@ -1014,7 +1016,7 @@ pub(crate) const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Song (highlighted, else playing)",
         &[
-            ("Enter", "play from here / open album"),
+            ("Enter", "play (album: from here)/open"),
             ("N a", "play next / add to queue"),
             ("A", "add the whole list to queue"),
             ("r", "radio from the song"),
@@ -1148,7 +1150,7 @@ mod tests {
         let screen: String = (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
-        assert!(screen.contains(SETTINGS[SETTINGS.len() - 1]), "last setting not on screen:\n{screen}");
+        assert!(screen.contains(SETTINGS[SETTINGS.len() - 1].label()), "last setting not on screen:\n{screen}");
         // The tab bar fits: the last tab is not cut off.
         assert!(screen.lines().next().unwrap().contains("6 "), "{screen}");
     }
